@@ -890,6 +890,11 @@ NDIS_STATUS MPOID_CreateOidCopy
         NdisOidRequest, OidWrite, pAdapter->nPendingOidReq)
     );
 
+    if ((NdisOidRequest == NULL) || (OidWrite == NULL))
+    {
+        return NDIS_STATUS_INVALID_DATA;
+    }
+
     OidWrite->OidReference = NdisOidRequest;
     OidWrite->OidReqCopy.RequestType = NdisOidRequest->RequestType;
     OidWrite->OidReqCopy.RequestId = NdisOidRequest->RequestId;
@@ -910,6 +915,13 @@ NDIS_STATUS MPOID_CreateOidCopy
                 NdisOidRequest->DATA.SET_INFORMATION.BytesRead;
             OidWrite->OidReqCopy.DATA.SET_INFORMATION.BytesNeeded =
                 NdisOidRequest->DATA.SET_INFORMATION.BytesNeeded;
+
+            if ((length > 0) &&
+                (NdisOidRequest->DATA.SET_INFORMATION.InformationBuffer == NULL))
+            {
+                OidWrite->OidReqCopy.DATA.SET_INFORMATION.InformationBufferLength = 0;
+                return NDIS_STATUS_INVALID_DATA;
+            }
 
             if (length > 0)
             {
@@ -948,6 +960,13 @@ NDIS_STATUS MPOID_CreateOidCopy
                 NdisOidRequest->DATA.QUERY_INFORMATION.BytesWritten;
             OidWrite->OidReqCopy.DATA.QUERY_INFORMATION.BytesNeeded =
                 NdisOidRequest->DATA.QUERY_INFORMATION.BytesNeeded;
+
+            if ((length > 0) &&
+                (NdisOidRequest->DATA.QUERY_INFORMATION.InformationBuffer == NULL))
+            {
+                OidWrite->OidReqCopy.DATA.QUERY_INFORMATION.InformationBufferLength = 0;
+                return NDIS_STATUS_INVALID_DATA;
+            }
 
             if (length > 0)
             {
@@ -1003,14 +1022,6 @@ VOID MPOID_CleanupOidCopy
 {
     ULONG cleaned = 0;  // for tracking purpose
 
-    QCNET_DbgPrint
-    (
-        MP_DBG_MASK_CONTROL | MP_DBG_MASK_OID_QMI,
-        MP_DBG_LEVEL_TRACE,
-        ("<%s> -->MPOID_CleanupOidCopy: 0x%p/0x%p-P%d\n", pAdapter->PortName,
-        OidWrite->OidReference, OidWrite, pAdapter->nPendingOidReq)
-    );
-
     if (OidWrite == NULL)
     {
         QCNET_DbgPrint
@@ -1022,6 +1033,14 @@ VOID MPOID_CleanupOidCopy
         );
         return;
     }
+
+    QCNET_DbgPrint
+    (
+        MP_DBG_MASK_CONTROL | MP_DBG_MASK_OID_QMI,
+        MP_DBG_LEVEL_TRACE,
+        ("<%s> -->MPOID_CleanupOidCopy: 0x%p/0x%p-P%d\n", pAdapter->PortName,
+        OidWrite->OidReference, OidWrite, pAdapter->nPendingOidReq)
+    );
 
     switch (OidWrite->OidReqCopy.RequestType)
     {
@@ -1817,7 +1836,16 @@ NDIS_STATUS MPOID_QueryInformation
                     pOID->OidType = fMP_QUERY_OID;
                     pOID->pOIDResp = NULL;
 #ifdef NDIS60_MINIPORT
-                    MPOID_CreateOidCopy(pAdapter, oidRequest, pOID);
+                    Status = MPOID_CreateOidCopy(pAdapter, oidRequest, pOID);
+                    if (Status != NDIS_STATUS_SUCCESS)
+                    {
+                        NdisAcquireSpinLock(&pAdapter->OIDLock);
+                        MPOID_CleanupOidCopy(pAdapter, pOID);
+                        InsertTailList(&pAdapter->OIDFreeList, &pOID->List);
+                        InterlockedDecrement(&(pAdapter->nBusyOID));
+                        NdisReleaseSpinLock(&pAdapter->OIDLock);
+                        break;
+                    }
 #endif // NDIS60_MINIPORT
 
                     // keep things working, to clean up later -- TODO
@@ -2029,9 +2057,10 @@ NDIS_STATUS MPOID_QueryInformation
     {
         // If the OID is one of the ones we need to forward to QC USB
         // This is just a normal Query handled by the miniport
-        if (ulInfoLen <= InformationBufferLength)
+        if ((ulInfoLen <= InformationBufferLength) &&
+            ((ulInfoLen == 0) || (InformationBuffer != NULL)))
         {
-            // Copy result into InformationBuffer
+            // Copy result into InformationBuffer.
             *BytesWritten = ulInfoLen;
             if (ulInfoLen)
             {
@@ -2044,7 +2073,7 @@ NDIS_STATUS MPOID_QueryInformation
         }
         else
         {
-            // too short
+            // The caller either supplied no output buffer or a short one.
             *BytesNeeded = ulInfoLen;
             Status = NDIS_STATUS_BUFFER_TOO_SHORT;
         }
@@ -2066,6 +2095,63 @@ NDIS_STATUS MPOID_QueryInformation
 
 
 /*** MiniportSetInformation ***/
+
+#ifdef NDIS620_MINIPORT
+static NDIS_STATUS MPOID_ValidateWwanSetRequest
+(
+    NDIS_OID Oid,
+    PVOID InformationBuffer,
+    ULONG InformationBufferLength,
+    PULONG BytesNeeded
+)
+{
+    ULONG requiredLength = 0;
+
+    switch (Oid)
+    {
+        case OID_WWAN_RADIO_STATE:
+            requiredLength = sizeof(NDIS_WWAN_SET_RADIO_STATE);
+            break;
+        case OID_WWAN_PIN:
+            requiredLength = sizeof(NDIS_WWAN_SET_PIN);
+            break;
+        case OID_WWAN_REGISTER_STATE:
+            requiredLength = sizeof(NDIS_WWAN_SET_REGISTER_STATE);
+            break;
+        case OID_WWAN_SIGNAL_STATE:
+            requiredLength = sizeof(NDIS_WWAN_SET_SIGNAL_INDICATION);
+            break;
+        case OID_WWAN_PACKET_SERVICE:
+            requiredLength = sizeof(NDIS_WWAN_SET_PACKET_SERVICE);
+            break;
+        case OID_WWAN_PROVISIONED_CONTEXTS:
+            requiredLength = sizeof(NDIS_WWAN_SET_PROVISIONED_CONTEXT);
+            break;
+        case OID_WWAN_CONNECT:
+            requiredLength = sizeof(NDIS_WWAN_SET_CONTEXT_STATE);
+            break;
+        case OID_WWAN_SMS_CONFIGURATION:
+            requiredLength = sizeof(NDIS_WWAN_SET_SMS_CONFIGURATION);
+            break;
+        case OID_WWAN_SMS_SEND:
+            requiredLength = sizeof(NDIS_WWAN_SMS_SEND);
+            break;
+        case OID_WWAN_SMS_DELETE:
+            requiredLength = sizeof(NDIS_WWAN_SMS_DELETE);
+            break;
+        default:
+            return NDIS_STATUS_SUCCESS;
+    }
+
+    if ((InformationBuffer == NULL) || (InformationBufferLength < requiredLength))
+    {
+        *BytesNeeded = requiredLength;
+        return NDIS_STATUS_INVALID_LENGTH;
+    }
+
+    return NDIS_STATUS_SUCCESS;
+}
+#endif // NDIS620_MINIPORT
 
 NDIS_STATUS MPOID_SetInformation
 (
@@ -2091,6 +2177,34 @@ NDIS_STATUS MPOID_SetInformation
     oidRequest = qcmpReq->OidRequest;
     InformationBuffer = oidRequest->DATA.SET_INFORMATION.InformationBuffer;
 #endif // NDIS60_MINIPORT
+
+    if ((BytesRead == NULL) || (BytesNeeded == NULL))
+    {
+        return NDIS_STATUS_INVALID_DATA;
+    }
+
+    *BytesRead = 0;
+    *BytesNeeded = 0;
+
+    if ((InformationBufferLength > 0) && (InformationBuffer == NULL))
+    {
+        *BytesNeeded = InformationBufferLength;
+        return NDIS_STATUS_INVALID_DATA;
+    }
+
+#ifdef NDIS620_MINIPORT
+    Status = MPOID_ValidateWwanSetRequest
+    (
+        Oid,
+        InformationBuffer,
+        InformationBufferLength,
+        BytesNeeded
+    );
+    if (Status != NDIS_STATUS_SUCCESS)
+    {
+        return Status;
+    }
+#endif // NDIS620_MINIPORT
 
     QCNET_DbgPrint
     (
@@ -2173,6 +2287,8 @@ NDIS_STATUS MPOID_SetInformation
                     MP_DBG_LEVEL_ERROR,
                     ("<%s> MPOID_SetInformation: OID_PNP_SET_POWER: BUF SHORT %d\n", pAdapter->PortName, InformationBufferLength)
                 );
+                *BytesNeeded = sizeof(NDIS_DEVICE_POWER_STATE);
+                return NDIS_STATUS_INVALID_LENGTH;
             }
             else if (InformationBuffer != NULL)
             {
@@ -2231,6 +2347,7 @@ NDIS_STATUS MPOID_SetInformation
                 }
 
                 USBIF_SetPowerState(pAdapter->USBDo, pwrState);
+                *BytesRead = sizeof(NDIS_DEVICE_POWER_STATE);
             }
             else
             {
@@ -2242,7 +2359,7 @@ NDIS_STATUS MPOID_SetInformation
                 );
             }
 
-            return NDIS_STATUS_SUCCESS;
+            return (InformationBuffer != NULL) ? NDIS_STATUS_SUCCESS : NDIS_STATUS_INVALID_DATA;
         }  // OID_PNP_SET_POWER
 
         case OID_GEN_PROTOCOL_OPTIONS:
@@ -2321,7 +2438,16 @@ NDIS_STATUS MPOID_SetInformation
                     pOID->pOIDResp = NULL;
 
 #ifdef NDIS60_MINIPORT
-                    MPOID_CreateOidCopy(pAdapter, oidRequest, pOID);
+                    Status = MPOID_CreateOidCopy(pAdapter, oidRequest, pOID);
+                    if (Status != NDIS_STATUS_SUCCESS)
+                    {
+                        NdisAcquireSpinLock(&pAdapter->OIDLock);
+                        MPOID_CleanupOidCopy(pAdapter, pOID);
+                        InsertTailList(&pAdapter->OIDFreeList, &pOID->List);
+                        InterlockedDecrement(&(pAdapter->nBusyOID));
+                        NdisReleaseSpinLock(&pAdapter->OIDLock);
+                        break;
+                    }
 #endif // NDIS60_MINIPORT
 
                     // keep things working, to clean up later -- TODO
