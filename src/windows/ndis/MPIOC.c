@@ -1,4 +1,4 @@
-/*====*====*====*====*====*====*====*====*====*====*====*====*====*====*====*
+﻿/*====*====*====*====*====*====*====*====*====*====*====*====*====*====*====*
 
                           M P I O C . C
 
@@ -94,7 +94,15 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     fileObj = irpStack->FileObject;
 
-    if (fileObj->FileName.Length != 0)
+    /* IRP_MJ_QUERY_SECURITY and IRP_MJ_SET_SECURITY carry no FileObject.
+     * Skip the QMI-type extraction for those major functions entirely. */
+    if ((irpStack->MajorFunction == IRP_MJ_QUERY_SECURITY) ||
+        (irpStack->MajorFunction == IRP_MJ_SET_SECURITY))
+    {
+       goto MPIOC_SkipFileNameParse;
+    }
+
+    if (fileObj != NULL && fileObj->FileName.Length != 0)
     {
        RtlUnicodeStringToAnsiString(&ansiString, &(fileObj->FileName), TRUE);
        if (RtlCharToInteger( (PCSZ)&(ansiString.Buffer[1]), 10, &QMIType) != STATUS_SUCCESS)
@@ -108,6 +116,8 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
        }
        RtlFreeAnsiString(&ansiString);
     }
+
+MPIOC_SkipFileNameParse:
 
     pIocDev = MPIOC_FindIoDevice(NULL, DeviceObject, NULL, NULL, Irp, QMIType);
     if (pIocDev == NULL)
@@ -1525,7 +1535,7 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
              {
                 QCNET_DbgPrint
                 (
-                   MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
+                                      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
                    ("<%s> MPIOC: IRP_MJ_DEVICE_CONTROL/UNKNOWN to 0x%p\n", pAdapter->PortName, DeviceObject)
                 );
                 status = STATUS_UNSUCCESSFUL;
@@ -1535,9 +1545,69 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
           break;
        }
 
-       default:
+       case IRP_MJ_QUERY_SECURITY:
+       {
+          QCNET_DbgPrint
+          (
+             MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
+             ("<%s> MPIOC: IRP_MJ_QUERY_SECURITY to 0x%p\n", pAdapter->PortName, DeviceObject)
+          );
+          /* This device does not maintain a custom security descriptor.
+           * Return STATUS_NOT_SUPPORTED so the I/O manager falls back to
+           * the default object-manager security. */
+          Irp->IoStatus.Information = 0;
+          status = STATUS_NOT_SUPPORTED;
           break;
-    }
+       }
+
+       case IRP_MJ_SET_SECURITY:
+       {
+          PSECURITY_DESCRIPTOR sd;
+          PIO_STACK_LOCATION   secStack = IoGetCurrentIrpStackLocation(Irp);
+
+          QCNET_DbgPrint
+          (
+             MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
+             ("<%s> MPIOC: IRP_MJ_SET_SECURITY to 0x%p\n", pAdapter->PortName, DeviceObject)
+          );
+          /* Validate the descriptor before touching it. The HLK fuzz test
+           * (FillZeroPageWithNull=True) may supply NULL or a malformed
+           * descriptor; dereferencing it is the proximate cause of the
+           * 0xC0000005 AV seen in PGHook.dll. */
+          sd = secStack->Parameters.SetSecurity.SecurityDescriptor;
+          if (sd == NULL || !RtlValidSecurityDescriptor(sd))
+          {
+             QCNET_DbgPrint
+             (
+                MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
+                ("<%s> MPIOC: IRP_MJ_SET_SECURITY - invalid SecurityDescriptor\n",
+                  pAdapter->PortName)
+             );
+             Irp->IoStatus.Information = 0;
+             status = STATUS_INVALID_PARAMETER;
+             break;
+          }
+          Irp->IoStatus.Information = 0;
+          status = STATUS_SUCCESS;
+          break;
+       }
+
+       default:
+       {
+          QCNET_DbgPrint
+          (
+             MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
+             ("<%s> MPIOC: unhandled MajorFunction 0x%x\n",
+               pAdapter->PortName, irpStack->MajorFunction)
+          );
+          status = STATUS_INVALID_DEVICE_REQUEST;
+          Irp->IoStatus.Status = status;
+          Irp->IoStatus.Information = 0;
+          IoCompleteRequest(Irp, IO_NO_INCREMENT);
+          InterlockedDecrement(&(pIocDev->IrpCount));
+          return status;
+       }
+     }
 
    if (status != STATUS_PENDING)
    {
