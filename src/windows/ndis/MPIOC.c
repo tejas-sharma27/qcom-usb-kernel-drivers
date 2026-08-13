@@ -1534,9 +1534,9 @@ MPIOC_SkipFileNameParse:
              default:
              {
                 QCNET_DbgPrint
-                (
-                                      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                   ("<%s> MPIOC: IRP_MJ_DEVICE_CONTROL/UNKNOWN to 0x%p\n", pAdapter->PortName, DeviceObject)
+                 (
+                    MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
+                    ("<%s> MPIOC: IRP_MJ_DEVICE_CONTROL/UNKNOWN to 0x%p\n", pAdapter->PortName, DeviceObject)
                 );
                 status = STATUS_UNSUCCESSFUL;
                 break;
