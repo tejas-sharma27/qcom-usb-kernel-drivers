@@ -24,7 +24,6 @@ GENERAL DESCRIPTION
 
 #include "qcfilter.h"
 #include "qcfilterioc.h"
-#include "FilterSecurity.h"
 
 #ifdef EVENT_TRACING
 #define WPP_GLOBALLOGGER
@@ -136,11 +135,9 @@ DriverEntry(PDRIVER_OBJECT  driverObject, PUNICODE_STRING registryPath)
         driverObject->MajorFunction[IRP_MJ_WRITE] =
         driverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] =
         driverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] =
+        driverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] =
+        driverObject->MajorFunction[IRP_MJ_SET_SECURITY] =
         QCFilterDispatchIo;
-
-    // Register dedicated security handlers for DF-Fuzz compliance
-    driverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = FilterDispatchQuerySecurity;
-    driverObject->MajorFunction[IRP_MJ_SET_SECURITY] = FilterDispatchSetSecurity;
 
     //
     // ControlLock is to synchronize multiple threads creating & deleting

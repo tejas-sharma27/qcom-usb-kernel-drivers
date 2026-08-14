@@ -264,8 +264,6 @@
     <ClCompile Include="MPUsb.c" />
     <ClCompile Include="MPWork.c" />
     <ClCompile Include="MPWWAN.c" />
-    <ClCompile Include="MPSecurity.c" />
-    <ClCompile Include="MPSecurityIntegration.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\qcversion.h" />
@@ -300,7 +298,6 @@
     <ClInclude Include="MPWork.h" />
     <ClInclude Include="MPWPP.h" />
     <ClInclude Include="MPWWAN.h" />
-    <ClInclude Include="MPSecurity.h" />
     <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>

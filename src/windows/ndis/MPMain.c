@@ -29,7 +29,6 @@ GENERAL DESCRIPTION
 #include "MPOID.h"
 #include "MPWWAN.h"
 #include "MPIP.h"
-#include "MPSecurity.h"
 
 #pragma NDIS_INIT_FUNCTION(DriverEntry)
 
@@ -409,18 +408,6 @@ NDIS_STATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath)
     else
     {
         USBIF_SetupDispatchFilter(DriverObject);
-
-        //
-        // Register security handlers for DF-Fuzz Query and Set Security Test
-        //
-#ifdef NDIS_WDM
-        if (gDriverObject != NULL)
-        {
-            gDriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = MPDispatchQuerySecurity;
-            gDriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = MPDispatchSetSecurity;
-            QCNET_DbgPrintG(("<%s> Security handlers registered\n", gDeviceName));
-        }
-#endif
 
         if (QCMP_NDIS6_Ok == FALSE)
         {

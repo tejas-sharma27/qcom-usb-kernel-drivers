@@ -21,7 +21,6 @@ GENERAL DESCRIPTION
 #include "MPQCTL.h"
 #include "MPUSB.h"
 #include "MPQMUX.h"
-#include "MPSecurity.h"
 
 // EVENT_TRACING
 #ifdef EVENT_TRACING
@@ -96,18 +95,11 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     fileObj = irpStack->FileObject;
 
     /* IRP_MJ_QUERY_SECURITY and IRP_MJ_SET_SECURITY carry no FileObject.
-     * Handle these security IRPs with dedicated security handlers. */
+     * Skip the QMI-type extraction for those major functions entirely. */
     if ((irpStack->MajorFunction == IRP_MJ_QUERY_SECURITY) ||
         (irpStack->MajorFunction == IRP_MJ_SET_SECURITY))
     {
-       if (irpStack->MajorFunction == IRP_MJ_QUERY_SECURITY)
-       {
-          return MPDispatchQuerySecurity(DeviceObject, Irp);
-       }
-       else
-       {
-          return MPDispatchSetSecurity(DeviceObject, Irp);
-       }
+       goto MPIOC_SkipFileNameParse;
     }
 
     if (fileObj != NULL && fileObj->FileName.Length != 0)
