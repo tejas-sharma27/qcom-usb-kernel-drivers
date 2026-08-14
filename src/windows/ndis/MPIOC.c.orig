@@ -21,7 +21,6 @@ GENERAL DESCRIPTION
 #include "MPQCTL.h"
 #include "MPUSB.h"
 #include "MPQMUX.h"
-#include "MPSecurity.h"
 
 // EVENT_TRACING
 #ifdef EVENT_TRACING
@@ -91,23 +90,16 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     ULONG              QMIType = 0;
     ANSI_STRING        ansiString;
 
-    irpStack = IoGetCurrentIrpStackLocation(Irp);
+        irpStack = IoGetCurrentIrpStackLocation(Irp);
 
     fileObj = irpStack->FileObject;
 
     /* IRP_MJ_QUERY_SECURITY and IRP_MJ_SET_SECURITY carry no FileObject.
-     * Handle these security IRPs with dedicated security handlers. */
+     * Skip the QMI-type extraction for those major functions entirely. */
     if ((irpStack->MajorFunction == IRP_MJ_QUERY_SECURITY) ||
         (irpStack->MajorFunction == IRP_MJ_SET_SECURITY))
     {
-       if (irpStack->MajorFunction == IRP_MJ_QUERY_SECURITY)
-       {
-          return MPDispatchQuerySecurity(DeviceObject, Irp);
-       }
-       else
-       {
-          return MPDispatchSetSecurity(DeviceObject, Irp);
-       }
+       goto MPIOC_SkipFileNameParse;
     }
 
     if (fileObj != NULL && fileObj->FileName.Length != 0)
@@ -122,7 +114,7 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
           IoCompleteRequest(Irp, IO_NO_INCREMENT);
           return STATUS_UNSUCCESSFUL;
        }
-       RtlFreeAnsiString(&ansiString);
+              RtlFreeAnsiString(&ansiString);
     }
 
 MPIOC_SkipFileNameParse:
@@ -379,6 +371,7 @@ MPIOC_SkipFileNameParse:
                PsGetCurrentProcessId(), pIocDev, DeviceObject, pIocDev->Type, pIocDev->ClientId)
           );
 
+          
 #if 0
           if (pIocDev->SecurityReset == 0)
           {
@@ -412,14 +405,28 @@ MPIOC_SkipFileNameParse:
              }
              else
              #endif // QCMP_SUPPORT_CTRL_QMIC
-             {
+                          {
                 // Release client ID for TYPE_CLIENT
-                MPQCTL_ReleaseClientId
-                (
-                   pIocDev->Adapter,
-                   pIocDev->QMIType,
-                   pIocDev  // Context
-                );
+                // Skip QMI device communication if surprise-removed
+                // to avoid hanging on a device that is already gone
+                if ((pAdapter->Flags & fMP_ADAPTER_SURPRISE_REMOVED) == 0)
+                {
+                   MPQCTL_ReleaseClientId
+                   (
+                      pIocDev->Adapter,
+                      pIocDev->QMIType,
+                      pIocDev  // Context
+                   );
+                }
+                else
+                {
+                   QCNET_DbgPrint
+                   (
+                      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
+                      ("<%s> MPIOC: _CLOSE: skip ReleaseClientId on surprise removal\n",
+                        pAdapter->PortName)
+                   );
+                }
              }
 
              pIocDev->Acquired = FALSE;
@@ -1542,27 +1549,37 @@ MPIOC_SkipFileNameParse:
              default:
              {
                 QCNET_DbgPrint
-                 (
-                    MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                    ("<%s> MPIOC: IRP_MJ_DEVICE_CONTROL/UNKNOWN to 0x%p\n", pAdapter->PortName, DeviceObject)
+                (
+                   MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
+                   ("<%s> MPIOC: IRP_MJ_DEVICE_CONTROL/UNKNOWN to 0x%p\n", pAdapter->PortName, DeviceObject)
                 );
                 status = STATUS_UNSUCCESSFUL;
                 break;
              }
           }
-          break;
+                    break;
        }
 
        case IRP_MJ_QUERY_SECURITY:
        {
+          PIO_STACK_LOCATION secStack = IoGetCurrentIrpStackLocation(Irp);
+
           QCNET_DbgPrint
           (
              MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
              ("<%s> MPIOC: IRP_MJ_QUERY_SECURITY to 0x%p\n", pAdapter->PortName, DeviceObject)
           );
-          /* This device does not maintain a custom security descriptor.
-           * Return STATUS_NOT_SUPPORTED so the I/O manager falls back to
-           * the default object-manager security. */
+
+          if (secStack == NULL)
+          {
+             status = STATUS_INVALID_PARAMETER;
+             break;
+          }
+
+          /* RmNet/WWAN control device does not maintain a custom security descriptor.
+           * Return STATUS_NOT_SUPPORTED so the I/O manager falls back to the
+           * default object-manager security, which is the correct behaviour for
+           * an NDIS WDM miniport control device object. */
           Irp->IoStatus.Information = 0;
           status = STATUS_NOT_SUPPORTED;
           break;
@@ -1570,18 +1587,25 @@ MPIOC_SkipFileNameParse:
 
        case IRP_MJ_SET_SECURITY:
        {
+          PIO_STACK_LOCATION secStack = IoGetCurrentIrpStackLocation(Irp);
           PSECURITY_DESCRIPTOR sd;
-          PIO_STACK_LOCATION   secStack = IoGetCurrentIrpStackLocation(Irp);
 
           QCNET_DbgPrint
           (
              MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
              ("<%s> MPIOC: IRP_MJ_SET_SECURITY to 0x%p\n", pAdapter->PortName, DeviceObject)
           );
-          /* Validate the descriptor before touching it. The HLK fuzz test
-           * (FillZeroPageWithNull=True) may supply NULL or a malformed
-           * descriptor; dereferencing it is the proximate cause of the
-           * 0xC0000005 AV seen in PGHook.dll. */
+
+          if (secStack == NULL)
+          {
+             status = STATUS_INVALID_PARAMETER;
+             break;
+          }
+
+          /* Validate the security descriptor supplied by the caller before
+           * touching it.  The fuzz test (FillZeroPageWithNull=True) may pass
+           * a NULL or malformed descriptor; dereferencing it without this
+           * check is the proximate cause of the 0xC0000005 AV in PGHook.dll. */
           sd = secStack->Parameters.SetSecurity.SecurityDescriptor;
           if (sd == NULL || !RtlValidSecurityDescriptor(sd))
           {
@@ -1595,27 +1619,31 @@ MPIOC_SkipFileNameParse:
              status = STATUS_INVALID_PARAMETER;
              break;
           }
+
+          /* Accept the request without actually modifying the device object
+           * security.  The device security is managed by the INF/SDDL string
+           * set at device creation time and must not be overridden at runtime. */
           Irp->IoStatus.Information = 0;
           status = STATUS_SUCCESS;
           break;
        }
 
-       default:
-       {
-          QCNET_DbgPrint
-          (
-             MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-             ("<%s> MPIOC: unhandled MajorFunction 0x%x\n",
-               pAdapter->PortName, irpStack->MajorFunction)
-          );
-          status = STATUS_INVALID_DEVICE_REQUEST;
-          Irp->IoStatus.Status = status;
-          Irp->IoStatus.Information = 0;
-          IoCompleteRequest(Irp, IO_NO_INCREMENT);
-          InterlockedDecrement(&(pIocDev->IrpCount));
-          return status;
-       }
-     }
+        default:
+        {
+        QCNET_DbgPrint
+            (
+                MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
+                ("<%s> MPIOC: Unhandled MajorFunction 0x%x\n",
+                pAdapter->PortName, irpStack->MajorFunction)
+            );
+            status = STATUS_INVALID_DEVICE_REQUEST;
+            Irp->IoStatus.Status = status;
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            InterlockedDecrement(&(pIocDev->IrpCount));
+            return status;
+        }
+    }
 
    if (status != STATUS_PENDING)
    {
@@ -2195,7 +2223,7 @@ NDIS_STATUS MPIOC_RegisterAllDevices
    #endif  // NDIS60_MINIPORT
 
    NdisZeroMemory(DispatchTable, (IRP_MJ_MAXIMUM_FUNCTION+1) * sizeof(PDRIVER_DISPATCH));
-      DispatchTable[IRP_MJ_CREATE]         = MPIOC_IRPDispatch;
+   DispatchTable[IRP_MJ_CREATE]         = MPIOC_IRPDispatch;
    DispatchTable[IRP_MJ_CLEANUP]        = MPIOC_IRPDispatch;
    DispatchTable[IRP_MJ_CLOSE]          = MPIOC_IRPDispatch;
    DispatchTable[IRP_MJ_DEVICE_CONTROL] = MPIOC_IRPDispatch;
@@ -2203,7 +2231,6 @@ NDIS_STATUS MPIOC_RegisterAllDevices
    DispatchTable[IRP_MJ_WRITE]          = MPIOC_Write;
    DispatchTable[IRP_MJ_QUERY_SECURITY] = MPIOC_IRPDispatch;
    DispatchTable[IRP_MJ_SET_SECURITY]   = MPIOC_IRPDispatch;
-
    myDeviceName = ExAllocatePool(NonPagedPool, 1024);
    if (myDeviceName == NULL)
    {
@@ -2475,8 +2502,8 @@ NDIS_STATUS MPIOC_RegisterFilterDevice
    NDIS_DEVICE_OBJECT_ATTRIBUTES   DeviceObjectAttributes;
    #endif  // NDIS60_MINIPORT
 
-   NdisZeroMemory(DispatchTable, (IRP_MJ_MAXIMUM_FUNCTION+1) * sizeof(PDRIVER_DISPATCH));
-      DispatchTable[IRP_MJ_CREATE]         = MPIOC_IRPDispatch;
+      NdisZeroMemory(DispatchTable, (IRP_MJ_MAXIMUM_FUNCTION+1) * sizeof(PDRIVER_DISPATCH));
+   DispatchTable[IRP_MJ_CREATE]         = MPIOC_IRPDispatch;
    DispatchTable[IRP_MJ_CLEANUP]        = MPIOC_IRPDispatch;
    DispatchTable[IRP_MJ_CLOSE]          = MPIOC_IRPDispatch;
    DispatchTable[IRP_MJ_DEVICE_CONTROL] = MPIOC_IRPDispatch;
@@ -2832,2863 +2859,2870 @@ PMPIOC_DEV_INFO MPIOC_FindIoDevice
                      }
                      else
                      {
-                        if ((pIocDev->ClientId == pQMI->ClientId) ||
-                            (pIocDev->ClientIdV6 == pQMI->ClientId) ||
-                            ((pQMI->ClientId == QMUX_BROADCAST_CID) &&
-                            (pIocDev->ClientId != 0)))
-                        {
-                           foundDO = pIocDev;
-                        }
-                     }
-                  }
-                  else
-
-                  #endif // QCMP_SUPPORT_CTRL_QMIC
-                  {
-                     if ((pIocDev->ClientId == pQMI->ClientId) ||
-                         (pIocDev->ClientIdV6 == pQMI->ClientId) ||
-                         ((pQMI->ClientId == QMUX_BROADCAST_CID) &&
-                         (pIocDev->ClientId != 0)))
-                     {
-                        foundDO = pIocDev;
-                     }
-                  }
-               }
-            }
-            else                   // find the next IocDev
-            {
-               if ((bReferenceFound == TRUE) && (pIocDev->ClientId != 0))
-               {
-                  // for broadcast, we only compare QMI type
-                  // TODO: ADD MORE LOGIC to check the correct adapter list
-                  // Search the primary adapter's secondary adapter list and then IoDev of
-                  // each seconday adapter list
-                  if ((pIocDev->QMIType == pQMI->QMIType)
-                      &&
-                      ((pDevExt != NULL) && (((pDevExt->MuxInterface.MuxEnabled != 0x01) && (pIocDev->Adapter == pAdapter)) ||
-                        ((pDevExt->MuxInterface.MuxEnabled == 0x01) && (pDevExt1->MuxInterface.PhysicalInterfaceNumber == pDevExt->MuxInterface.PhysicalInterfaceNumber) &&
-                         (pDevExt1->MuxInterface.FilterDeviceObj == pDevExt->MuxInterface.FilterDeviceObj)))
-                      ))
-                  {
-                     foundDO = pIocDev;  // unconditional, regardless of QMI CID and TYPE
-                  }
-               }
-               if (IocDevice == pIocDev)
-               {
-                  bReferenceFound = TRUE;
-               }
-            }
-         }
-         peekEntry = peekEntry->Flink;
-      }  // while
-   }
-
-   NdisReleaseSpinLock(MP_CtlLock);
-
-   return foundDO;
-}  // MPIOC_FindIoDevice
-
-VOID MPIOC_CancelGetServiceFileIrpRoutine
-(
-   PDEVICE_OBJECT DeviceObject,
-   PIRP           pIrp
-)
-{
-   PMPIOC_DEV_INFO pIocDev;
-   PMP_ADAPTER     pAdapter;
-   PFILE_OBJECT    fileObj;
-   ULONG           QMIType = 0;
-   PIO_STACK_LOCATION irpStack;
-   ANSI_STRING        ansiString;
-
-   irpStack = IoGetCurrentIrpStackLocation(pIrp);
-
-   IoReleaseCancelSpinLock(pIrp->CancelIrql);
-
-   fileObj = irpStack->FileObject;
-
-   if (fileObj->FileName.Length != 0)
-   {
-      RtlUnicodeStringToAnsiString(&ansiString, &(fileObj->FileName), TRUE);
-      if (RtlCharToInteger( (PCSZ)&(ansiString.Buffer[1]), 10, &QMIType) != STATUS_SUCCESS)
-      {
-         QCNET_DbgPrintG(("MPIOC Cxl 0x%p - invalid FileObject 0x%p\n", pIrp, DeviceObject));
-         RtlFreeAnsiString(&ansiString);
-         return;
-      }
-      RtlFreeAnsiString(&ansiString);
-   }
-
-   pIocDev = MPIOC_FindIoDevice(NULL, DeviceObject, NULL, NULL, pIrp, QMIType);
-   if (pIocDev == NULL)
-   {
-      QCNET_DbgPrintG(("MPIOC Cxl RD: invalid called DO 0x%p\n", DeviceObject));
-      return;
-   }
-
-   pAdapter = pIocDev->Adapter;
-
-   NdisAcquireSpinLock(MP_CtlLock);
-
-   if (IoSetCancelRoutine(pIrp, NULL) != NULL)
-   {
-      InterlockedDecrement(&(pIocDev->IrpCount));
-      pIocDev->GetServiceFileIrp = NULL;
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("GetServiceFileIrp NULL for 0x%p - 2\n", pIocDev)
-      );
-      NdisReleaseSpinLock(MP_CtlLock);
-      pIrp->IoStatus.Status = STATUS_CANCELLED;
-      pIrp->IoStatus.Information = 0;
-      IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-   }
-   else
-   {
-      NdisReleaseSpinLock(MP_CtlLock);
-      // IRP is in cancellation, do nothing
-   }
-
-}  // MPIOC_CancelGetServiceFileIrpRoutine
-
-// ================== Read for External Client ===================
-
-NTSTATUS MPIOC_Read
-(
-   IN PDEVICE_OBJECT DeviceObject,
-   IN PIRP           Irp
-)
-{
-   NTSTATUS           nts = STATUS_PENDING;
-   PMPIOC_DEV_INFO    pIocDev;
-   PMP_ADAPTER        pAdapter;
-   ULONG              outlen;
-   PVOID              pReadBuffer;
-   PFILE_OBJECT    fileObj;
-   ULONG           QMIType = 0;
-   PIO_STACK_LOCATION  irpStack;
-   ANSI_STRING        ansiString;
-
-   irpStack = IoGetCurrentIrpStackLocation(Irp);
-
-   fileObj = irpStack->FileObject;
-
-   if (fileObj->FileName.Length != 0)
-   {
-      RtlUnicodeStringToAnsiString(&ansiString, &(fileObj->FileName), TRUE);
-      if (RtlCharToInteger( (PCSZ)&(ansiString.Buffer[1]), 10, &QMIType) != STATUS_SUCCESS)
-      {
-         QCNET_DbgPrintG(("CIRP Cu 0x%p - invalid FileObject 0x%p\n", Irp, DeviceObject));
-         RtlFreeAnsiString(&ansiString);
-         Irp->IoStatus.Information = 0;
-         Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-         return STATUS_UNSUCCESSFUL;
-      }
-      RtlFreeAnsiString(&ansiString);
-   }
-
-   pIocDev = MPIOC_FindIoDevice(NULL, DeviceObject, NULL, NULL, Irp, QMIType);
-   if (pIocDev == NULL)
-   {
-      QCNET_DbgPrintG(("RIRP Cu 0x%p -invalid called DO 0x%p\n", Irp, DeviceObject));
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   pAdapter = pIocDev->Adapter;
-
-#if 0
-   if (pIocDev->SecurityReset == 0)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> RIRP Cu 0x%p security not reset, rejected\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-#endif
-
-   if (Irp->MdlAddress != NULL)
-   {
-      pReadBuffer = MmGetSystemAddressForMdlSafe(Irp->MdlAddress,HighPagePriority);
-      outlen = MPIOC_GetMdlTotalCount(Irp->MdlAddress);
-   }
-   else
-   {
-      pReadBuffer = Irp->AssociatedIrp.SystemBuffer;
-      outlen = irpStack->Parameters.Read.Length;
-   }
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> RIRP => 0x%p(%uB) DO 0x%p IF %u IOC 0x%p\n", pAdapter->PortName, Irp, outlen,
-        DeviceObject, USBIF_GetDataInterfaceNumber(pAdapter->USBDo), pIocDev)
-   );
-
-   if ((pIocDev->Type == MP_DEV_TYPE_CONTROL) ||
-       (pIocDev->ClientId == 0))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> RIRP Cu 0x%p -wrong client type, rejected\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   if (outlen == 0)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> RIRP Cs 0x%p -zero byte\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_SUCCESS;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_SUCCESS;
-   }
-
-   if (pReadBuffer == NULL)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> RIRP Cinv 0x%p -NULL buf\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_INVALID_PARAMETER;
-   }
-
-   if (MP_STATE_STOP(pIocDev))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> RIRP Cu 0x%p -MP stopped, rejected\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   if (Irp->Cancel)
-   {
-      IoSetCancelRoutine(Irp, NULL);
-      nts = STATUS_CANCELLED;
-      NdisReleaseSpinLock(&pIocDev->IoLock);
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> RIRP cancelled 0x%p\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = nts;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return nts;
-   }
-
-   InterlockedIncrement(&(pIocDev->IrpCount));
-
-   // Try to fill or enqueue
-   if (!IsListEmpty(&pIocDev->ReadDataQueue))
-   {
-      PLIST_ENTRY headOfList;
-      PMPIOC_READ_ITEM rdItem;
-
-      headOfList = RemoveHeadList(&pIocDev->ReadDataQueue);
-      rdItem = CONTAINING_RECORD(headOfList, MPIOC_READ_ITEM, List);
-
-      outlen = irpStack->Parameters.Read.Length;
-
-      if (outlen >= rdItem->Length)
-      {
-         NdisMoveMemory
-         (
-            (PVOID)Irp->AssociatedIrp.SystemBuffer,
-            (PVOID)rdItem->Buffer,
-            rdItem->Length
-         );
-         Irp->IoStatus.Information = rdItem->Length;
-         Irp->IoStatus.Status = STATUS_SUCCESS;
-         nts = STATUS_SUCCESS;
-         ExFreePool(rdItem->Buffer);
-         ExFreePool(rdItem);
-      }
-      else
-      {
-         Irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
-         nts = STATUS_BUFFER_TOO_SMALL;
-         // put data back to queue
-         InsertHeadList(&pIocDev->ReadDataQueue, &rdItem->List);
-      }
-   }
-   else
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> MPIOC_Read: RIRP enqueue 0x%p IOC 0x%p\n", pAdapter->PortName, Irp, pIocDev)
-      );
-      InsertTailList(&pIocDev->ReadIrpQueue, &Irp->Tail.Overlay.ListEntry);
-
-      // Need to install cancel routine here.
-      IoSetCancelRoutine(Irp, MPIOC_CancelReadRoutine);
-      IoMarkIrpPending(Irp);
-
-   }
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-   if (nts != STATUS_PENDING)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> RIRP Cd 0x%p(0x%x)\n", pAdapter->PortName, Irp, nts)
-      );
-      InterlockedDecrement(&(pIocDev->IrpCount));
-
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-   }
-
-   return nts;
-}  // MPIOC_Read
-
-VOID MPIOC_CancelReadRoutine
-(
-   PDEVICE_OBJECT DeviceObject,
-   PIRP           pIrp
-)
-{
-   PMPIOC_DEV_INFO pIocDev;
-   PMP_ADAPTER     pAdapter;
-   PFILE_OBJECT    fileObj;
-   ULONG           QMIType = 0;
-   PIO_STACK_LOCATION  irpStack;
-   ANSI_STRING        ansiString;
-
-   irpStack = IoGetCurrentIrpStackLocation(pIrp);
-
-   IoReleaseCancelSpinLock(pIrp->CancelIrql);
-
-   fileObj = irpStack->FileObject;
-
-   if (fileObj->FileName.Length != 0)
-   {
-      RtlUnicodeStringToAnsiString(&ansiString, &(fileObj->FileName), TRUE);
-      if (RtlCharToInteger( (PCSZ)&(ansiString.Buffer[1]), 10, &QMIType) != STATUS_SUCCESS)
-      {
-         QCNET_DbgPrintG(("MPIOC Cxl RD 0x%p - invalid FileObject 0x%p\n", pIrp, DeviceObject));
-         RtlFreeAnsiString(&ansiString);
-         return;
-      }
-      RtlFreeAnsiString(&ansiString);
-   }
-
-   pIocDev = MPIOC_FindIoDevice(NULL, DeviceObject, NULL, NULL, pIrp, QMIType);
-   if (pIocDev == NULL)
-   {
-      QCNET_DbgPrintG(("MPIOC Cxl RD: invalid called DO 0x%p\n", DeviceObject));
-      return;
-   }
-
-   pAdapter = pIocDev->Adapter;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-      ("<%s> -->MPIOC_CancelReadRoutine: 0x%p IOC 0x%p\n", pAdapter->PortName, pIrp, pIocDev)
-   );
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   if (MPIOC_IsIrpInQueue(pIocDev, pIrp, 0) == TRUE)
-   {
-      RemoveEntryList(&pIrp->Tail.Overlay.ListEntry);
-      pIrp->IoStatus.Status = STATUS_CANCELLED;
-      pIrp->IoStatus.Information = 0;
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> MPIOC_CancelReadRoutine: enqueue to complete IRP 0x%p (IOC 0x%p)\n", pAdapter->PortName, pIrp, pIocDev)
-      );
-      InsertTailList(&pIocDev->IrpCompletionQueue, &pIrp->Tail.Overlay.ListEntry);
-      KeSetEvent(&pIocDev->EmptyCompletionQueueEvent, IO_NO_INCREMENT, FALSE);
-   }
-   else
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> MPIOC_CancelReadRoutine: IRP de-queued 0x%p\n", pAdapter->PortName, pIrp)
-      );
-   }
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-      ("<%s> <--MPIOC_CancelReadRoutine: IOC 0x%p\n", pAdapter->PortName, pIocDev)
-   );
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-}  // MPIOC_CancelReadRoutine
-
-// ================== Write for External Client ===================
-
-NTSTATUS MPIOC_Write
-(
-   IN PDEVICE_OBJECT DeviceObject,
-   IN PIRP           Irp
-)
-{
-   NTSTATUS              nts = STATUS_PENDING;
-   PMPIOC_DEV_INFO       pIocDev;
-   PMP_ADAPTER           pAdapter;
-   BOOLEAN               bQueueWasEmpty = FALSE;
-   ULONG                 inlen = 0;
-   PVOID                 pWriteBuffer;
-   PFILE_OBJECT    fileObj;
-   ULONG           QMIType = 0;
-   PIO_STACK_LOCATION  irpStack;
-   ANSI_STRING        ansiString;
-
-   irpStack = IoGetCurrentIrpStackLocation(Irp);
-
-   fileObj = irpStack->FileObject;
-
-   if (fileObj->FileName.Length != 0)
-   {
-      RtlUnicodeStringToAnsiString(&ansiString, &(fileObj->FileName), TRUE);
-      if (RtlCharToInteger( (PCSZ)&(ansiString.Buffer[1]), 10, &QMIType) != STATUS_SUCCESS)
-      {
-         QCNET_DbgPrintG(("CIRP Cu 0x%p - invalid FileObject 0x%p\n", Irp, DeviceObject));
-         RtlFreeAnsiString(&ansiString);
-         Irp->IoStatus.Information = 0;
-         Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-         return STATUS_UNSUCCESSFUL;
-      }
-      RtlFreeAnsiString(&ansiString);
-   }
-
-   pIocDev = MPIOC_FindIoDevice(NULL, DeviceObject, NULL, NULL, Irp, QMIType);
-   if (pIocDev == NULL)
-   {
-      QCNET_DbgPrintG(("WIRP Cu 0x%p -invalid called DO 0x%p\n", Irp, DeviceObject));
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   pAdapter = pIocDev->Adapter;
-
-#if 0
-   if (pIocDev->SecurityReset == 0)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> WIRP Cu 0x%p security not reset, rejected\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-#endif
-
-   if (Irp->MdlAddress != NULL)
-   {
-      pWriteBuffer = MmGetSystemAddressForMdlSafe(Irp->MdlAddress,HighPagePriority);
-      inlen = MPIOC_GetMdlTotalCount(Irp->MdlAddress);
-   }
-   else
-   {
-      pWriteBuffer = Irp->AssociatedIrp.SystemBuffer;
-      inlen = irpStack->Parameters.Write.Length;
-   }
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> WIRP => 0x%p(%uB) DO 0x%p IF %u\n", pAdapter->PortName, Irp, inlen,
-        DeviceObject, USBIF_GetDataInterfaceNumber(pAdapter->USBDo))
-   );
-
-   if (inlen == 0)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("WIRP Cs 0x%p -zero byte\n", Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_SUCCESS;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_SUCCESS;
-   }
-
-   if (pWriteBuffer == NULL)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("WIRP Cinv 0x%p -invalid buf\n", Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_INVALID_PARAMETER;
-   }
-
-   if (Irp->Cancel)
-   {
-      IoSetCancelRoutine(Irp, NULL);
-      nts = STATUS_CANCELLED;
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> WIRP cancelled 0x%p\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = nts;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return nts;
-   }
-
-   if (MP_STATE_STOP(pIocDev))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> WIRP Cu 0x%p -MP stopped, rejected\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   if ((pIocDev->Type == MP_DEV_TYPE_CONTROL) ||
-       (pIocDev->ClientId == 0))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> WIRP Cu 0x%p -wrong client type, rejected\n", pAdapter->PortName, Irp)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   #ifdef QCMP_SUPPORT_CTRL_QMIC
-
-   if (pAdapter->ExternalQCTLEnabled == FALSE)
-
-   #endif // QCMP_SUPPORT_CTRL_QMIC
-
-   if ((pIocDev->QMIType <= QMUX_TYPE_CTL) ||
-       (inlen < (QCQMUX_HDR_SIZE+QCQMUX_MSG_HDR_SIZE)))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> WIRP Cu 0x%p -wrong QMI type or data too short %dB\n",
-           pAdapter->PortName, Irp, inlen)
-      );
-      Irp->IoStatus.Information = 0;
-      Irp->IoStatus.Status      = STATUS_UNSUCCESSFUL;
-      IoCompleteRequest(Irp, IO_NO_INCREMENT);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   InterlockedIncrement(&(pIocDev->IrpCount));
-
-   // IoSetCancelRoutine(Irp, MPIOC_CancelWriteRoutine);
-   // IoMarkIrpPending(Irp);
-
-   if (IsListEmpty(&pIocDev->WriteIrpQueue))
-   {
-      bQueueWasEmpty = TRUE;
-   }
-
-   // queue IRP to the WriteQueue
-   InsertTailList(&pIocDev->WriteIrpQueue, &Irp->Tail.Overlay.ListEntry);
-
-   // make IRP cancellable after it's placed in queue
-   // otherwise, cancel routine could be called before en-queuing
-   IoSetCancelRoutine(Irp, MPIOC_CancelWriteRoutine);
-   IoMarkIrpPending(Irp);
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-   if (bQueueWasEmpty == TRUE)
-   {
-      KeSetEvent(&pIocDev->KickWriteEvent, IO_NO_INCREMENT, FALSE);
-   }
-
-   return nts;
-}  // MPIOC_Write
-
-NTSTATUS MPIOC_WtIrpCompletion
-(
-   PDEVICE_OBJECT pDO,
-   PIRP           pIrp,
-   PVOID          pContext
-)
-{
-   PMPIOC_DEV_INFO pIocDev = (PMPIOC_DEV_INFO)pContext;
-
-   KeSetEvent(&pIocDev->WriteCompletionEvent, IO_NO_INCREMENT, FALSE);
-
-   return STATUS_MORE_PROCESSING_REQUIRED;
-}  // MPIOC_WtIrpCompletion
-
-// Write worker thread created by the system running at IRQL_PASSIVE_LEVEL
-void MPIOC_WriteThread
-(
-   PVOID           Context    // PMPIOC_DEV_INFO
-)
-{
-   PMPIOC_DEV_INFO pIocDev  = (PMPIOC_DEV_INFO)Context;
-   PMP_ADAPTER     pAdapter = pIocDev->Adapter;
-   PKWAIT_BLOCK    pwbArray = NULL;
-   PIRP            pIrp;
-   BOOLEAN         bPurged  = FALSE, bCancelled = FALSE;
-   PVOID           pActiveBuffer = NULL;
-   ULONG           ulReqBytes;
-   NTSTATUS        ntStatus;
-   PVOID           qmiBuffer       = NULL;
-   ULONG           qmiBufferLength = 0;
-   ULONG           sendBytes       = 0;
-   BOOLEAN         bFirstTime      = TRUE;
-   PIO_STACK_LOCATION pNextStack;
-   LARGE_INTEGER checkInterval;
-   PMP_ADAPTER returnAdapter;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> ---> MPIOC_WriteThread\n", pAdapter->PortName)
-   );
-
-   pwbArray = ExAllocatePool
-              (
-                 NonPagedPool,
-                 (IOCDEV_WRITE_EVENT_COUNT+1)*sizeof(KWAIT_BLOCK)
-              );
-
-   if (pwbArray == NULL)
-   {
-      MPIOC_EmptyIrpCompletionQueue(pIocDev);
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> MPIOC Wth: out of memory.\n", pAdapter->PortName)
-      );
-      return;
-   }
-
-   pIrp = IoAllocateIrp
-          (
-             (CCHAR)(pAdapter->USBDo->StackSize+1),
-             FALSE
-          );
-
-   if (pIrp == NULL)
-   {
-      MPIOC_EmptyIrpCompletionQueue(pIocDev);
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> MPIOC Wth: out of memory-IRP.\n", pAdapter->PortName)
-      );
-      ExFreePool(pwbArray);
-      return;
-   }
-
-   ntStatus = IoAcquireRemoveLock(pAdapter->pMPRmLock, NULL);
-   if (!NT_SUCCESS(ntStatus))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> MPIOC Wth: rm lock err\n", pAdapter->PortName)
-      );
-      ExFreePool(pwbArray);
-      IoFreeIrp(pIrp);
-      return;
-   }
-   else
-   {
-      QcStatsIncrement(pAdapter, MP_RML_TH, 100);
-   }
-
-   pIocDev->bWriteActive  = FALSE;
-   pIocDev->bWriteStopped = FALSE;
-   pIocDev->pWriteCurrent = NULL;  // PIRP
-
-   while (TRUE)
-   {
-     if ((pIocDev->bWriteStopped  == TRUE) ||
-         (bPurged                 == TRUE) ||
-         (USBIF_IsUsbBroken(pAdapter->USBDo) == TRUE))
-     {
-         // Purge write Queue
-         MPIOC_PurgeQueue
-         (
-            pIocDev,
-            &pIocDev->WriteIrpQueue,
-            &pIocDev->IoLock,
-            0
-         );
-         bPurged = FALSE;
-
-         if (bCancelled == TRUE)
-         {
-            break;
-         }
-         goto wait_for_completion;
-      }
-
-      // De-Queue
-      NdisAcquireSpinLock(&pIocDev->IoLock);
-      if ((!IsListEmpty(&pIocDev->WriteIrpQueue)) &&
-          (pIocDev->bWriteActive == FALSE) &&
-          (pAdapter->PendingCtrlRequests[pIocDev->QMIType] < pAdapter->MaxPendingQMIReqs))
-      {
-         PLIST_ENTRY        headOfList;
-         PIO_STACK_LOCATION irpStack;
-
-         headOfList = RemoveHeadList(&pIocDev->WriteIrpQueue);
-         pIocDev->pWriteCurrent = CONTAINING_RECORD
-                                  (
-                                     headOfList,
-                                     IRP,
-                                     Tail.Overlay.ListEntry
-                                  );
-         irpStack = IoGetCurrentIrpStackLocation(pIocDev->pWriteCurrent);
-
-         NdisReleaseSpinLock(&pIocDev->IoLock);
-
-         if (pActiveBuffer == NULL)
-         {
-            if ((pIocDev->pWriteCurrent)->MdlAddress != NULL)
-            {
-               pActiveBuffer = MmGetSystemAddressForMdlSafe
-                               (
-                                  (pIocDev->pWriteCurrent)->MdlAddress,
-                                  HighPagePriority
-                               );
-               ulReqBytes = MPIOC_GetMdlTotalCount
-                            (
-                               (pIocDev->pWriteCurrent)->MdlAddress
-                            );
-
-               QCNET_DbgPrint
-               (
-                  MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                  ("<%s> Wth MDL 0x%p(%uB)\n", pAdapter->PortName, pActiveBuffer, ulReqBytes)
-               );
-            }
-            else
-            {
-               pActiveBuffer = (pIocDev->pWriteCurrent)->AssociatedIrp.SystemBuffer;
-               ulReqBytes = irpStack->Parameters.Write.Length;
-
-               QCNET_DbgPrint
-               (
-                  MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                  ("<%s> Wth SYSB IRP 0x%p 0x%p(%uB)\n",
-                    pAdapter->PortName, pIocDev->pWriteCurrent, pActiveBuffer, ulReqBytes)
-               );
-            }
-
-            // make sure we have sufficient QMI buffer
-            if ((qmiBuffer == NULL) || (qmiBufferLength < (ulReqBytes+sizeof(QCQMI))))
-            {
-               if (qmiBuffer != NULL)
-               {
-                  ExFreePool(qmiBuffer);
-               }
-
-               qmiBuffer = ExAllocatePool(NonPagedPool, (ulReqBytes+sizeof(QCQMI)));
-
-               NdisAcquireSpinLock(&pIocDev->IoLock);
-
-               if (qmiBuffer == NULL)
-               {
-                  PIRP pIrp = pIocDev->pWriteCurrent;
-
-                  // out of memory, complete the de-queued IRP
-                  if (IoSetCancelRoutine(pIrp, NULL) != NULL)
-                  {
-                     pIrp->IoStatus.Status = STATUS_NO_MEMORY;
-                     InsertTailList
-                     (
-                        &pIocDev->IrpCompletionQueue,
-                        &pIrp->Tail.Overlay.ListEntry
-                     );
-                     KeSetEvent
-                     (
-                        &pIocDev->EmptyCompletionQueueEvent,
-                        IO_NO_INCREMENT,
-                        FALSE
-                     );
-                  }
-                  else
-                  {
-                     QCNET_DbgPrint
-                     (
-                        MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                        ("<%s> WIRP in cancellation 0x%p, NO_MEM\n", pAdapter->PortName, pIrp)
-                     );
-                     // we should continue completing the IRP as the CancelWriteRoutine does not cancel
-                     // the this IRP when it's no longer in WriteIrpQueue
-                     pIrp->IoStatus.Status = STATUS_CANCELLED;
-                     pIrp->IoStatus.Information = 0;
-                     InsertTailList
-                     (
-                        &pIocDev->IrpCompletionQueue,
-                        &pIrp->Tail.Overlay.ListEntry
-                     );
-                     KeSetEvent
-                     (
-                        &pIocDev->EmptyCompletionQueueEvent,
-                        IO_NO_INCREMENT,
-                        FALSE
-                     );
-                  }
-
-                  pIocDev->pWriteCurrent = NULL;
-                  qmiBufferLength = 0;
-
-                  QCNET_DbgPrint
-                  (
-                     MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-                     ("<%s> IocWth: NO_MEM for QMI", pAdapter->PortName)
-                  );
-
-                  NdisReleaseSpinLock(&pIocDev->IoLock);
-
-                  continue;  // back to the loop
-               }  // if (qmiBuffer == NULL)
-
-               // QMI message length including the USB IF type
-               qmiBufferLength = ulReqBytes+sizeof(QCQMI);
-
-               NdisReleaseSpinLock(&pIocDev->IoLock);
-            }
-         }  // if (pActiveBuffer == NULL)
-         else
-         {
-            goto wait_for_completion;
-         }
-
-         /*********
-         USBUTL_PrintBytes
-         (
-            pActiveBuffer,
-            ulReqBytes,
-            ulReqBytes,
-            "QMUX-W",
-            0,
-            MP_DBG_MASK_DAT_CTL,
-            MP_DBG_LEVEL_DATA
-         );
-         **********/
-
-         #ifdef QCMP_SUPPORT_CTRL_QMIC
-
-         // if ExternalQMICtrlCid is 0, we use TID to route messages
-         // otherwise we use driver assigned CID and route messages
-         // based on QMI type and CID (assuming the device supports
-         // non-zero CTL CID
-         if ((pAdapter->ExternalQCTLEnabled == TRUE) &&
-             (pIocDev->QMIType == QMUX_TYPE_CTL)     &&
-             (pAdapter->ExternalQMICtrlCid == 0))
-         {
-            if (pAdapter->QMIFuzzing == 0)
-            {
-               MPQMI_QMUXtoQMI
-               (
-                  pAdapter,
-                  pIocDev->QMIType,
-                  0,  // CID
-                  pActiveBuffer,
-                  ulReqBytes,
-                  qmiBuffer
-               );
-               sendBytes = ulReqBytes+sizeof(QCQMI_HDR);
-            }
-            else
-            {
-               NdisMoveMemory(qmiBuffer, pActiveBuffer, ulReqBytes);
-               sendBytes = ulReqBytes;
-            }
-         }
-         else
-         #endif // QCMP_SUPPORT_CTRL_QMIC
-         {
-            // now we have good QMI buffer, compose QMI
-            MPQMI_QMUXtoQMI
-            (
-               pAdapter,
-               pIocDev->QMIType,
-               pIocDev->ClientId,
-               pActiveBuffer,
-               ulReqBytes,
-               qmiBuffer
-            );
-            sendBytes = ulReqBytes+sizeof(QCQMI_HDR);
-         }
-
-         NdisAcquireSpinLock(&pIocDev->IoLock);
-         InterlockedIncrement(&(pAdapter->PendingCtrlRequests[pIocDev->QMIType]));
-         QCNET_DbgPrint
-         (
-            (MP_DBG_MASK_OID_QMI),
-            MP_DBG_LEVEL_DETAIL,
-            ("<%s> MPIOC_WriteThread : Number of IOC QMI requests pending for service %d is %d\n",
-              pAdapter->PortName,
-              pIocDev->QMIType,
-              pAdapter->PendingCtrlRequests[pIocDev->QMIType]
-            )
-         );
-         NdisReleaseSpinLock(&pIocDev->IoLock);
-
-         // set internal IRP
-         IoReuseIrp(pIrp, STATUS_SUCCESS);
-         pNextStack = IoGetNextIrpStackLocation(pIrp);
-         pIrp->MdlAddress                    = NULL;
-         pIrp->AssociatedIrp.SystemBuffer    = qmiBuffer;
-         pNextStack->MajorFunction           = IRP_MJ_DEVICE_CONTROL;
-         pNextStack->Parameters.DeviceIoControl.IoControlCode =
-                                               IOCTL_QCDEV_SEND_CONTROL;
-         pNextStack->Parameters.DeviceIoControl.InputBufferLength = sendBytes;
-
-         // set up DO to be passed to the completion routine
-         pNextStack->DeviceObject            = pIocDev->ControlDeviceObject;
-
-         IoSetCompletionRoutine
-         (
-            pIrp,
-            MPIOC_WtIrpCompletion,
-            pIocDev,
-            TRUE,
-            TRUE,
-            TRUE
-         );
-
-         pIocDev->bWriteActive = TRUE;
-         returnAdapter = FindStackDeviceObject(pAdapter);
-         if (returnAdapter != NULL)
-         {
-         ntStatus = QCIoCallDriver(returnAdapter->USBDo, pIrp);
-         }
-         else
-         {
-            ntStatus = STATUS_UNSUCCESSFUL;
-            pIrp->IoStatus.Status = ntStatus;
-            MPIOC_WtIrpCompletion(pAdapter->USBDo, pIrp, pIocDev);
-
-         }
-         if(ntStatus != STATUS_PENDING)
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> IocWth: IoCallDriver rtn 0x%x", pAdapter->PortName, ntStatus)
-            );
-         }
-      }
-      else
-      {
-         NdisReleaseSpinLock(&pIocDev->IoLock);
-      }
-
-wait_for_completion:
-
-      if (bFirstTime == TRUE)
-      {
-         bFirstTime = FALSE;
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> MPIOC_WriteThread started.\n", pAdapter->PortName)
-         );
-         KeSetEvent(&pIocDev->WriteThreadStartedEvent, IO_NO_INCREMENT, FALSE);
-      }
-
-      checkInterval.QuadPart = -(15 * 1000 * 1000); // 1.5 sec
-      ntStatus = KeWaitForMultipleObjects
-                 (
-                    IOCDEV_WRITE_EVENT_COUNT,
-                    (VOID **)&pIocDev->pWriteEvents,
-                    WaitAny,
-                    Executive,
-                    KernelMode,
-                    FALSE, // non-alertable
-                    &checkInterval,
-                    pwbArray
-                 );
-
-      switch(ntStatus)
-      {
-         case IOCDEV_WRITE_COMPLETION_EVENT_INDEX:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: WRITE_COMPLETION_EVENT\n", pAdapter->PortName)
-            );
-            KeClearEvent(&pIocDev->WriteCompletionEvent);
-            pIocDev->bWriteActive = FALSE;
-
-            NdisAcquireSpinLock(&pIocDev->IoLock);
-
-            ntStatus = pIrp->IoStatus.Status;
-
-            // complete IRP
-            MPIOC_WriteIrpCompletion(pIocDev, ulReqBytes, ntStatus, 0);
-
-            // Reset
-            pActiveBuffer          = NULL;
-            ulReqBytes             = 0;
-            pIocDev->pWriteCurrent = NULL;
-
-            NdisReleaseSpinLock(&pIocDev->IoLock);
-
-            break;
-         }  // WRITE_COMPLETION_EVENT_INDEX
-
-         case IOCDEV_EMPTY_COMPLETION_QUEUE_EVENT_INDEX:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: IOCDEV_EMPTY_COMPLETION_QUEUE\n", pAdapter->PortName)
-            );
-
-            KeClearEvent(&pIocDev->EmptyCompletionQueueEvent);
-            MPIOC_EmptyIrpCompletionQueue(pIocDev);
-
-            break;
-
-         }  // IOCDEV_EMPTY_COMPLETION_QUEUE_EVENT_INDEX
-
-         case IOCDEV_WRITE_CANCEL_CURRENT_EVENT_INDEX:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: IOCDEV_WRITE_CANCEL_CURRENT_EVENT\n", pAdapter->PortName)
-            );
-            KeClearEvent(&pIocDev->WriteCancelCurrentEvent);
-
-            NdisAcquireSpinLock(&pIocDev->IoLock);
-            if (pIocDev->pWriteCurrent == NULL)
-            {
-               NdisReleaseSpinLock(&pIocDev->IoLock);
-               break;
-            }
-            IoCancelIrp(pIrp);
-            NdisReleaseSpinLock(&pIocDev->IoLock);
-
-            break;
-         }
-
-         case IOCDEV_KICK_WRITE_EVENT_INDEX:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: IOCDEV_KICK_WRITE_EVENT\n", pAdapter->PortName)
-            );
-            KeClearEvent(&pIocDev->KickWriteEvent);
-
-            if (pIocDev->bWriteActive == TRUE)
-            {
-               goto wait_for_completion;
-            }
-            // else we just go around the loop again, picking up the next
-            // write entry
-            continue;
-         }
-
-         case IOCDEV_CANCEL_EVENT_INDEX:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: IOCDEV_CANCEL_EVENT\n", pAdapter->PortName)
-            );
-            // clear cancel event so we don't reactivate
-            KeClearEvent(&pIocDev->CancelWriteEvent);
-
-            // signal the loop that a cancel has occurred
-            pIocDev->bWriteStopped = bCancelled = TRUE;
-            if (pIocDev->bWriteActive == TRUE)
-            {
-               // cancel outstanding irp
-               IoCancelIrp(pIrp);
-
-               // wait for writes to complete, don't cancel
-               // if a write is active, continue to wait for the completion
-               // we pick up the canceled status at the top of the service
-               // loop
-               goto wait_for_completion;
-            }
-            break; // goto exit_WriteThread; // nothing active exit
-         }
-
-         case IOCDEV_WRITE_PURGE_EVENT_INDEX:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: IOCDEV_WRITE_PURGE_EVENT\n", pAdapter->PortName)
-            );
-            // clear purge event so we don't reactivate
-            KeClearEvent(&pIocDev->WritePurgeEvent);
-
-            // signal the loop that a purge has occurred
-            bPurged = TRUE;
-            if (pIocDev->bWriteActive == TRUE)
-            {
-               // cancel outstanding irp
-               IoCancelIrp(pIrp);
-
-               // wait for writes to complete, don't cancel
-               // if a write is active, continue to wait for the completion
-               // we pick up the canceled status at the top of the service
-               // loop
-               goto wait_for_completion;
-            }
-            break;
-         }
-
-         case IOCDEV_WRITE_STOP_EVENT_INDEX:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: IOCDEV_WRITE_STOP_EVENT\n", pAdapter->PortName)
-            );
-            KeClearEvent(&pIocDev->WriteStopEvent);
-            pIocDev->bWriteStopped = TRUE;
-            break;
-         }
-
-         default:
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> MP_Wth: default sig 0x%x", pAdapter->PortName, ntStatus)
-            );
-
-            break;
-         }
-      }  // switch
-   }  // end while forever
-
-exit_WriteThread:
-
-   if (pIrp != NULL)
-   {
-      IoFreeIrp(pIrp);
-   }
-   if (pwbArray != NULL)
-   {
-      ExFreePool(pwbArray);
-      pwbArray = NULL;
-   }
-   if (qmiBuffer != NULL)
-   {
-      ExFreePool(qmiBuffer);
-      qmiBuffer = NULL;
-   }
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> <--- MPIOC_WriteThread (dev 0x%p, DO 0x%p)\n", pAdapter->PortName, pIocDev, pIocDev->ControlDeviceObject)
-   );
-
-   KeSetEvent(&pIocDev->WtWorkerThreadExitEvent, IO_NO_INCREMENT, FALSE);
-
-   QcMpIoReleaseRemoveLock(pAdapter, pAdapter->pMPRmLock, NULL, MP_RML_TH, 100)
-
-}  // MPIOC_WriteThread
-
-VOID MPIOC_EmptyIrpCompletionQueue(PMPIOC_DEV_INFO pIocDev)
-{
-   PMP_ADAPTER     pAdapter = pIocDev->Adapter;
-   PLIST_ENTRY     headOfList;
-   PIRP            pIrp;
-   BOOLEAN         bComplete;
-   BOOLEAN         bCancelled = FALSE;
-   KIRQL           irql = KeGetCurrentIrql();
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> --> MPIOC_EmptyIrpCompletionQueue: IOC 0x%p (Cnt %d)\n", pAdapter->PortName, pIocDev, pIocDev->IrpCount)
-   );
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   while (!IsListEmpty(&pIocDev->IrpCompletionQueue))
-   {
-      bComplete = TRUE;
-      headOfList = RemoveHeadList(&pIocDev->IrpCompletionQueue);
-      pIrp = CONTAINING_RECORD(headOfList, IRP, Tail.Overlay.ListEntry);
-
-      // There should be no cancel routine, so we proceed to completion
-      if (IoSetCancelRoutine(pIrp, NULL) != NULL)
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-            ("<%s> EmptyIrpCompletionQueue: FATAL-IRP with cancellation Rtn 0x%p, still proceed\n", pAdapter->PortName, pIrp)
-         );
-         // bComplete = FALSE;
-      }
-      else
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-            ("<%s> EmptyIrpCompletionQueue: cancelling IRP 0x%p (flag %d)\n", pAdapter->PortName, pIrp, bComplete)
-         );
-         bCancelled = TRUE;
-      }
-      NdisReleaseSpinLock(&pIocDev->IoLock);
-
-      if (bComplete == TRUE)
-      {
-         if ((irql == PASSIVE_LEVEL) && (bCancelled == TRUE))
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> IOC copletion: IRP cancelled 0x%p\n", pAdapter->PortName, pIrp)
-            );
-            MPMAIN_Wait(-(2 * 1000 * 10));  // 2ms
-         }
-
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> IRP C 0x%p(0x%x)\n", pAdapter->PortName, pIrp, pIrp->IoStatus.Status)
-         );
-         IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-         InterlockedDecrement(&(pIocDev->IrpCount));
-      }
-
-      NdisAcquireSpinLock(&pIocDev->IoLock);
-   }
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> <-- MPIOC_EmptyIrpCompletionQueue: IOC 0x%p (pending %d)\n", pAdapter->PortName, pIocDev, pIocDev->IrpCount)
-   );
-}  // MPIOC_EmptyIrpCompletionQueue
-
-VOID MPIOC_PurgeQueue
-(
-   PMPIOC_DEV_INFO pIocDev,
-   PLIST_ENTRY     queue,
-   PNDIS_SPIN_LOCK pSpinLock,
-   UCHAR           cookie
-)
-{
-   PMP_ADAPTER pAdapter = pIocDev->Adapter;
-   PLIST_ENTRY headOfList;
-   PIRP        pIrp;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> ---> MPIOC_PurgeQueue(%d)\n", pAdapter->PortName, cookie)
-   );
-
-   NdisAcquireSpinLock(pSpinLock);
-
-   while (!IsListEmpty(queue))
-   {
-      headOfList = RemoveHeadList(queue);
-      pIrp =  CONTAINING_RECORD
-              (
-                 headOfList,
-                 IRP,
-                 Tail.Overlay.ListEntry
-              );
-      if (IoSetCancelRoutine(pIrp, NULL) != NULL)
-      {
-         pIrp->IoStatus.Status = STATUS_CANCELLED;
-         pIrp->IoStatus.Information = 0;
-         InsertTailList
-         (
-            &pIocDev->IrpCompletionQueue,
-            &pIrp->Tail.Overlay.ListEntry
-         );
-      }
-      else
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-            ("<%s> MPIOC_PurgeQueue: err-IRP already cancelled 0x%p\n", pAdapter->PortName, pIrp)
-         );
-
-         // we should continue IRP completion as the CancelRoutine does not proceed when IRP is not in R/W queue
-         pIrp->IoStatus.Status = STATUS_CANCELLED;
-         pIrp->IoStatus.Information = 0;
-         InsertTailList
-         (
-            &pIocDev->IrpCompletionQueue,
-            &pIrp->Tail.Overlay.ListEntry
-         );
-      }
-   }
-
-   NdisReleaseSpinLock(pSpinLock);
-
-   MPIOC_EmptyIrpCompletionQueue(pIocDev);
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> <--- MPIOC_PurgeQueue(%d)\n", pAdapter->PortName, cookie)
-   );
-
-}  // MPIOC_PurgeQueue
-
-ULONG MPIOC_GetMdlTotalCount(PMDL Mdl)
-{
-   PMDL pCurrentMdlBuffer;
-   ULONG totalCount = 0L;
-
-   pCurrentMdlBuffer = Mdl;
-
-   while (pCurrentMdlBuffer != NULL)
-   {
-      totalCount += MmGetMdlByteCount(pCurrentMdlBuffer);
-      pCurrentMdlBuffer = pCurrentMdlBuffer->Next;
-   }
-
-   return totalCount;
-}  // MPIOC_GetMdlTotalCount
-
-NTSTATUS MPIOC_WriteIrpCompletion
-(
-   PMPIOC_DEV_INFO   pIocDev,
-   ULONG             ulRequestedBytes,
-   NTSTATUS          ntStatus,
-   UCHAR             cookie
-)
-{
-   PIRP pIrp;
-   PMP_ADAPTER pAdapter = pIocDev->Adapter;
-
-   pIrp = pIocDev->pWriteCurrent;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> MP_WIC<%d>: IRP 0x%p (0x%x)\n", pAdapter->PortName, cookie, pIrp, ntStatus)
-   );
-
-
-   if (NT_SUCCESS(ntStatus) || (ntStatus == STATUS_CANCELLED))
-   {
-      pIocDev->iErrorCount = 0;
-   }
-   else
-   {
-      pIocDev->iErrorCount++;
-
-      // after some magic number of times of failure,
-      // we mark the device as 'removed'
-      if ( (ntStatus != STATUS_INVALID_PARAMETER) &&
-             (pAdapter->IgnoreQMICTLErrors != TRUE) )
-      {
-          // after some magic number of times of failure,
-          // we mark the device as 'removed'
-          if (pIocDev->iErrorCount > pIocDev->NumOfRetriesOnError)
-          {
-             QCNET_DbgPrint
-             (
-                MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                ("<%s> MP_WIC: failure %d, dev removed\n", pAdapter->PortName, pIocDev->iErrorCount)
-             );
-             pIocDev->bWriteStopped  = TRUE;
-             pIocDev->iErrorCount = pIocDev->NumOfRetriesOnError;
-          }
-      }
-   }
-
-   if (pIrp != NULL) // if it wasn't canceled out of the block
-   {
-      if (IoSetCancelRoutine(pIrp, NULL) == NULL)
-      {
-         // this happens when MPIOC_CancelWriteRoutine is called
-         // MPIOC_CancelWriteRoutine will do nothing since IRP already de-queued
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-            ("<%s> MP_WIRPC: WIRP 0x%p already cxled\n", pAdapter->PortName, pIrp)
-         );
-         // continue completing IRP since MPIOC_CancelWriteRoutine does nothing in this case
-      }
-
-      pIrp->IoStatus.Information = ulRequestedBytes;
-      pIrp->IoStatus.Status = ntStatus;
-
-      InsertTailList(&pIocDev->IrpCompletionQueue, &pIrp->Tail.Overlay.ListEntry);
-      KeSetEvent(&pIocDev->EmptyCompletionQueueEvent, IO_NO_INCREMENT, FALSE);
-   }
-   else
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> MP_WIC NULL IRP-%d\n", pAdapter->PortName, cookie)
-      );
-   }
-
-ExitWriteCompletion:
-
-   return ntStatus;
-}  // MPIOC_WriteIrpCompletion
-
-BOOLEAN MPIOC_IsIrpInQueue(PMPIOC_DEV_INFO pIocDev, PIRP WriteIrp, INT QueueFlag)
-{
-   PLIST_ENTRY listHead, thisEntry, ioQueue;
-   BOOLEAN     bMatchFound = FALSE;
-   PIRP        pIrp = NULL;
-
-   // Be sure you own IoLock before getting here!!!!
-
-   if (QueueFlag == 0)
-   {
-      ioQueue = &pIocDev->ReadIrpQueue;
-   }
-   else
-   {
-      ioQueue = &pIocDev->WriteIrpQueue;
-   }
-
-   if (!IsListEmpty(ioQueue))
-   {
-      // Start at the head of the list
-      listHead = ioQueue;
-      thisEntry = listHead->Flink;
-
-      while (thisEntry != listHead)
-      {
-         pIrp = CONTAINING_RECORD(thisEntry, IRP, Tail.Overlay.ListEntry);
-         if (WriteIrp == pIrp)
-         {
-            bMatchFound = TRUE;
-            break;
-         }
-         thisEntry = thisEntry->Flink;
-      }
-   }
-   return bMatchFound;
-}  // MPIOC_IsIrpInQueue
-
-VOID MPIOC_CancelWriteRoutine
-(
-   PDEVICE_OBJECT DeviceObject,
-   PIRP           pIrp
-)
-{
-   PMPIOC_DEV_INFO pIocDev;
-   PMP_ADAPTER     pAdapter;
-   PFILE_OBJECT    fileObj;
-   ULONG           QMIType = 0;
-   PIO_STACK_LOCATION  irpStack;
-   ANSI_STRING        ansiString;
-
-   irpStack = IoGetCurrentIrpStackLocation(pIrp);
-
-   IoReleaseCancelSpinLock(pIrp->CancelIrql);
-
-   fileObj = irpStack->FileObject;
-
-   if (fileObj->FileName.Length != 0)
-   {
-      RtlUnicodeStringToAnsiString(&ansiString, &(fileObj->FileName), TRUE);
-      if (RtlCharToInteger( (PCSZ)&(ansiString.Buffer[1]), 10, &QMIType) != STATUS_SUCCESS)
-      {
-         QCNET_DbgPrintG(("MPIOC: 0x%p - invalid FileObject 0x%p\n", pIrp, DeviceObject));
-         RtlFreeAnsiString(&ansiString);
-         return;
-      }
-      RtlFreeAnsiString(&ansiString);
-   }
-
-   pIocDev = MPIOC_FindIoDevice(NULL, DeviceObject, NULL, NULL, pIrp, QMIType);
-   if (pIocDev == NULL)
-   {
-      QCNET_DbgPrintG(("MPIOC: invalid called DO 0x%p for IRP 0x%p\n", DeviceObject, pIrp));
-      return;
-   }
-
-   pAdapter = pIocDev->Adapter;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-      ("<%s> MPIOC_CancelWriteRoutine: 0x%p\n", pAdapter->PortName, pIrp)
-   );
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   if ((pIocDev->pWriteCurrent == pIrp) && (pIocDev->bWriteActive == TRUE))
-   {
-      // this happens when IRP is in IO process but not completed yet
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> MPIOC_CancelWriteRoutine: IRP in IO processing, restore CxlRtn %p\n", pAdapter->PortName, pIrp)
-      );
-      IoSetCancelRoutine(pIrp, MPIOC_CancelWriteRoutine);
-      KeSetEvent(&pIocDev->WriteCancelCurrentEvent, IO_NO_INCREMENT, FALSE);
-   }
-   else
-   {
-      // proceed only if IRP is in queue
-      if (MPIOC_IsIrpInQueue(pIocDev, pIrp, 1) == TRUE)
-      {
-         RemoveEntryList(&pIrp->Tail.Overlay.ListEntry);
-         pIrp->IoStatus.Status = STATUS_CANCELLED;
-         pIrp->IoStatus.Information = 0;
-         InsertTailList(&pIocDev->IrpCompletionQueue, &pIrp->Tail.Overlay.ListEntry);
-         KeSetEvent(&pIocDev->EmptyCompletionQueueEvent, IO_NO_INCREMENT, FALSE);
-      }
-      else
-      {
-         // this only happens when IRP is in the middle of completion
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-            ("<%s> MPIOC_CancelWriteRoutine: IRP de-queued %p\n", pAdapter->PortName, pIrp)
-         );
-      }
-   }
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-}  // MPIOC_CancelWriteRoutine
-
-NTSTATUS MPIOC_StartWriteThread(PMPIOC_DEV_INFO pIocDev)
-{
-   PMP_ADAPTER       pAdapter = pIocDev->Adapter;
-   NTSTATUS          ntStatus = STATUS_SUCCESS;
-   KIRQL             irql     = KeGetCurrentIrql();
-   OBJECT_ATTRIBUTES objAttr;
-
-   // Make sure the write thread is created with IRQL==PASSIVE_LEVEL
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   if (((pIocDev->pWriteThread == NULL)        &&
-        (pIocDev->hWriteThreadHandle == NULL)) &&
-       (irql > PASSIVE_LEVEL))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> MPIOC_WT IRQL high %d\n", pAdapter->PortName, irql)
-      );
-      NdisReleaseSpinLock(&pIocDev->IoLock);
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   if ((pIocDev->hWriteThreadHandle == NULL) &&
-       (pIocDev->pWriteThread == NULL))
-   {
-      NTSTATUS ntStatus;
-
-      if (pIocDev->bWtThreadInCreation == FALSE)
-      {
-         pIocDev->bWtThreadInCreation = TRUE;
-         NdisReleaseSpinLock(&pIocDev->IoLock);
-      }
-      else
-      {
-         NdisReleaseSpinLock(&pIocDev->IoLock);
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> MPIOC_WT th in creation\n", pAdapter->PortName)
-         );
-         return STATUS_SUCCESS;
-      }
-
-      KeClearEvent(&pIocDev->WriteThreadStartedEvent);
-      InitializeObjectAttributes(&objAttr, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-      ntStatus = PsCreateSystemThread
-                 (
-                    OUT &pIocDev->hWriteThreadHandle,
-                    IN THREAD_ALL_ACCESS,
-                    IN &objAttr,     // POBJECT_ATTRIBUTES  ObjectAttributes
-                    IN NULL,         // HANDLE  ProcessHandle
-                    OUT NULL,        // PCLIENT_ID  ClientId
-                    IN (PKSTART_ROUTINE)MPIOC_WriteThread,
-                    IN (PVOID)pIocDev
-                 );
-      if (ntStatus != STATUS_SUCCESS)
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> MPIOC_WT th failure 0x%x\n", pAdapter->PortName, ntStatus)
-         );
-         pIocDev->pWriteThread = NULL;
-         pIocDev->hWriteThreadHandle = NULL;
-         pIocDev->bWtThreadInCreation = FALSE;
-         return ntStatus;
-      }
-
-      ntStatus = KeWaitForSingleObject
-                 (
-                    &pIocDev->WriteThreadStartedEvent,
-                    Executive,
-                    KernelMode,
-                    FALSE,
-                    NULL
-                 );
-      KeClearEvent(&pIocDev->WriteThreadStartedEvent);
-
-      ntStatus = ObReferenceObjectByHandle
-                 (
-                    pIocDev->hWriteThreadHandle,
-                    THREAD_ALL_ACCESS,
-                    NULL,
-                    KernelMode,
-                    (PVOID*)&pIocDev->pWriteThread,
-                    NULL
-                 );
-      if (!NT_SUCCESS(ntStatus))
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> MPIOC_WT ObReferenceObjectByHandle failed 0x%x\n", pAdapter->PortName, ntStatus)
-         );
-         pIocDev->pWriteThread = NULL;
-      }
-      else
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> MPIOC_WT handle=0x%p thOb=0x%p\n", pAdapter->PortName,
-              pIocDev->hWriteThreadHandle, pIocDev->pWriteThread)
-         );
-         ZwClose(pIocDev->hWriteThreadHandle);
-         pIocDev->hWriteThreadHandle = NULL;
-      }
-
-      pIocDev->bWtThreadInCreation = FALSE;
-   }
-   else
-   {
-      NdisReleaseSpinLock(&pIocDev->IoLock);
-   }
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> MPIOC_WT alive-%d    irql-0x%x\n", pAdapter->PortName, ntStatus, irql)
-   );
-
-   return ntStatus;
-}  // MPIOC_StartWriteThread
-
-VOID MPIOC_CancelWriteThread
-(
-   PMPIOC_DEV_INFO pIocDev
-)
-{
-   PMP_ADAPTER   pAdapter = pIocDev->Adapter;
-   NTSTATUS      ntStatus;
-   LARGE_INTEGER timeoutValue;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> MPIOC_CxlWtTh-0: 0x%p/0x%p(type %d, id %d)\n", pAdapter->PortName,
-        pIocDev, pIocDev->ControlDeviceObject, pIocDev->QMIType, pIocDev->ClientId)
-   );
-
-   if (KeGetCurrentIrql() > PASSIVE_LEVEL)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL,
-         MP_DBG_LEVEL_CRITICAL,
-         ("<%s> MPIOC Cxl: wrong IRQL\n", pAdapter->PortName)
-      );
-      return;
-   }
-
-   if (InterlockedIncrement(&pIocDev->WriteThreadInCancellation) > 1)
-   {
-      while ((pIocDev->hWriteThreadHandle != NULL) || (pIocDev->pWriteThread != NULL))
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL,
-            MP_DBG_LEVEL_ERROR,
-            ("<%s> MPIOC cxl in pro %d\n", pAdapter->PortName, pIocDev->WriteThreadInCancellation)
-         );
-         MPMAIN_Wait(-(3 * 1000 * 1000));  // 300ms
-      }
-      InterlockedDecrement(&pIocDev->WriteThreadInCancellation);
-      return;
-   }
-
-   if ((pIocDev->hWriteThreadHandle == NULL) &&
-       (pIocDev->pWriteThread == NULL))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> MPIOC_CxlWtTh: already cancelled IODEV 0x%p\n", pAdapter->PortName, pIocDev)
-      );
-      InterlockedDecrement(&pIocDev->WriteThreadInCancellation);
-      return;
-   }
-
-   // if (pIocDev->DeviceOpenCount > 0)
-   if ((pIocDev->hWriteThreadHandle != NULL) || (pIocDev->pWriteThread != NULL))
-   {
-      KeClearEvent(&pIocDev->WtWorkerThreadExitEvent);
-      KeSetEvent(&pIocDev->CancelWriteEvent, IO_NO_INCREMENT, FALSE);
-
-      if (pIocDev->pWriteThread != NULL)
-      {
-         ntStatus = KeWaitForSingleObject
-                    (
-                       pIocDev->pWriteThread,
-                       Executive,
-                       KernelMode,
-                       FALSE,
-                       NULL
-                    );
-         ObDereferenceObject(pIocDev->pWriteThread);
-         KeClearEvent(&pIocDev->WtWorkerThreadExitEvent);
-         ZwClose(pIocDev->hWriteThreadHandle);
-      }
-      else // best effort
-      {
-         timeoutValue.QuadPart = -(50 * 1000 * 1000);   // 5.0 sec
-         ntStatus = KeWaitForSingleObject
-                    (
-                       &pIocDev->WtWorkerThreadExitEvent,
-                       Executive,
-                       KernelMode,
-                       FALSE,
-                       &timeoutValue
-                    );
-         if (ntStatus == STATUS_TIMEOUT)
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-               ("<%s> MPIOC_CxlWtTh: timeout for dev 0x%p\n", pAdapter->PortName, pIocDev)
-            );
-         }
-         KeClearEvent(&pIocDev->WtWorkerThreadExitEvent);
-         ZwClose(pIocDev->hWriteThreadHandle);
-      }
-      pIocDev->hWriteThreadHandle = NULL;
-      pIocDev->pWriteThread       = NULL;
-   }
-   else
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> MPIOC_CxlWtTh: device already closed, no action.\n", pAdapter->PortName)
-      );
-   }
-
-   InterlockedDecrement(&pIocDev->WriteThreadInCancellation);
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> MPIOC_CxlWtTh-1: 0x%p/0x%p(type %d, id %d)\n", pAdapter->PortName,
-        pIocDev, pIocDev->ControlDeviceObject, pIocDev->QMIType, pIocDev->ClientId)
-   );
-}  // MPIOC_CancelWriteThread
-
-// cleanup I/O queues (ReadIrpQueue/WriteIrpQueue/ReadDataQueue)
-VOID MPIOC_CleanupQueues(PMPIOC_DEV_INFO pIocDev, UCHAR cookie)
-{
-   PMP_ADAPTER      pAdapter = pIocDev->Adapter;
-   PLIST_ENTRY      headOfList;
-   PMPIOC_READ_ITEM rdItem;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> ---> MPIOC_CleanupQueues (%d)\n", pAdapter->PortName, cookie));
-
-   MPIOC_PurgeQueue(pIocDev, &pIocDev->ReadIrpQueue, &pIocDev->IoLock, 1);
-   MPIOC_PurgeQueue(pIocDev, &pIocDev->WriteIrpQueue, &pIocDev->IoLock, 2);
-
-   // cleanup ReadDataQueue
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   while (!IsListEmpty(&pIocDev->ReadDataQueue))
-   {
-      headOfList = RemoveHeadList(&pIocDev->ReadDataQueue);
-      rdItem =  CONTAINING_RECORD
-                (
-                   headOfList,
-                   MPIOC_READ_ITEM,
-                   List
-                );
-      ExFreePool(rdItem->Buffer);
-      ExFreePool(rdItem);
-   }
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> <--- MPIOC_CleanupQueues (%d)\n", pAdapter->PortName, cookie)
-   );
-}  // MPIOC_CleanupQueues
-
-VOID MPIOC_SetStopState
-(
-   PMP_ADAPTER pAdapter,
-   BOOLEAN     TerminateAll
-)
-{
-    PMPIOC_DEV_INFO pIocDev;
-    PLIST_ENTRY     listHead, thisEntry;
-
-    NdisAcquireSpinLock(MP_CtlLock);
-
-    if (!IsListEmpty(&MP_DeviceList))
-    {
-        // Start at the head of the list
-        listHead = &MP_DeviceList;
-        thisEntry = listHead->Flink;
-
-        while (thisEntry != listHead)
-        {
-            pIocDev = CONTAINING_RECORD(thisEntry, MPIOC_DEV_INFO, List);
-
-            if (pIocDev != NULL &&
-                pIocDev->Adapter == pAdapter)
-            {
-               QCNET_DbgPrint
-               (
-                  MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                  ("<%s> PostRemovalNotification: dev 0x%p(%s) IRP 0x%p\n", pAdapter->PortName,
-                    pIocDev, pIocDev->ClientFileName, pIocDev->NotificationIrp)
-               );
-               MPIOC_PostRemovalNotification(pIocDev);
-               MPIOC_PostMtuNotification(pIocDev, 4, 0, TRUE);
-               MPIOC_PostMtuNotification(pIocDev, 6, 0, TRUE);
-               pIocDev->MPStopped = TRUE;
-               if (TerminateAll == TRUE)
-               {
-#if 0
-                  // Release client ID for TYPE_CLIENT?????
-                  // if (pAdapter->Flags & fMP_ADAPTER_SURPRISE_REMOVED)
-                  {
-                     pIocDev->Acquired = FALSE;
-                     pIocDev->ClientId = 0; // force to zero
-
-                     #ifdef QCMP_SUPPORT_CTRL_QMIC
-                     if (pIocDev->Type == MP_DEV_TYPE_EXTERNAL_CTL)
-                     {
-                        pIocDev->Type = MP_DEV_TYPE_CLIENT;
-                     }
-                     #endif // QCMP_SUPPORT_CTRL_QMIC
-                  }
-#endif
-                  QCNET_DbgPrint
-                  (
-                     MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                     ("<%s> PostRemovalNotification: dev 0x%p(%s) Acquired=FALSE\n",
-                       pAdapter->PortName, pIocDev, pIocDev->ClientFileName)
-                  );
-                  // terminate the write worker thread
-                  // MPIOC_CancelWriteThread(pIocDev);  // cannot run @IRQL2
-
-                  // Cleanup queues
-                  MPIOC_CleanupQueues(pIocDev, 1);
-               }
-            }
-
-            thisEntry = thisEntry->Flink;
-        }
-    }
-
-    NdisReleaseSpinLock(MP_CtlLock);
-
-}  // MPIOC_SetStopState
-
-VOID MPIOC_InvalidateClients(PMP_ADAPTER pAdapter)
-{
-    PMPIOC_DEV_INFO pIocDev;
-    PLIST_ENTRY     listHead, thisEntry;
-
-    NdisAcquireSpinLock(MP_CtlLock);
-
-    if (!IsListEmpty(&MP_DeviceList))
-    {
-        // Start at the head of the list
-        listHead = &MP_DeviceList;
-        thisEntry = listHead->Flink;
-
-        while (thisEntry != listHead)
-        {
-            pIocDev = CONTAINING_RECORD(thisEntry, MPIOC_DEV_INFO, List);
-
-            if (pIocDev != NULL &&
-                pIocDev->Adapter == pAdapter)
-            {
-               QCNET_DbgPrint
-               (
-                  MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-                  ("<%s> _InvalidateClients: PostRemovalNotification: dev 0x%p(%s) IRP 0x%p\n", pAdapter->PortName,
-                    pIocDev, pIocDev->ClientFileName, pIocDev->NotificationIrp)
-               );
-               MPIOC_PostRemovalNotification(pIocDev);
-               MPIOC_PostMtuNotification(pIocDev, 4, 0, TRUE);
-               MPIOC_PostMtuNotification(pIocDev, 6, 0, TRUE);
-               if (pIocDev->Type != MP_DEV_TYPE_CONTROL)
-               {
-                  pIocDev->MPStopped = TRUE;
-               }
-            }
-
-            thisEntry = thisEntry->Flink;
-        }
-    }
-
-    NdisReleaseSpinLock(MP_CtlLock);
-
-}  // MPIOC_InvalidateClients
-
-// =================== Custom Notification Support =====================
-
-NTSTATUS MPIOC_CacheNotificationIrp
-(
-   PMPIOC_DEV_INFO pIocDev,
-   PIRP            pIrp,
-   ULONG           Type
-)
-{
-   NTSTATUS           ntStatus;
-   PIO_STACK_LOCATION irpStack;
-   PMP_ADAPTER        pAdapter = pIocDev->Adapter;
-
-   pIrp->IoStatus.Information = 0;
-   ntStatus = STATUS_INVALID_PARAMETER;
-
-   if (pIrp->AssociatedIrp.SystemBuffer == NULL)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("CacheNotificationIrp: in buf NULL\n")
-      );
-      return ntStatus;
-   }
-
-   irpStack = IoGetCurrentIrpStackLocation(pIrp);
-   if (irpStack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(ULONG))
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("CacheNotificationIrp: in buf too small\n")
-      );
-      ntStatus = STATUS_BUFFER_TOO_SMALL;
-      return ntStatus;
-   }
-
-   if (pIocDev->MPStopped == TRUE)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("CacheNotificationIrp: device stopped, rejected\n")
-      );
-      return STATUS_UNSUCCESSFUL;
-   }
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   switch (Type)
-   {
-      case IOCTL_QCDEV_WAIT_NOTIFY:
-      {
-   // Got duplicated requests, deny it.
-   if (pIocDev->NotificationIrp != NULL)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("CacheNotificationIrp: duplicated req, rejected\n")
-      );
-      *(ULONG *)pIrp->AssociatedIrp.SystemBuffer = QCDEV_DUPLICATED_NOTIFICATION_REQ;
-      pIrp->IoStatus.Information = sizeof( ULONG );
-      pIrp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-      ntStatus = STATUS_UNSUCCESSFUL;
-   }
-   else
-   {
-      // always pend the IRP, never complete it immediately
-      ntStatus = STATUS_PENDING;
-      IoMarkIrpPending(pIrp);
-      pIocDev->NotificationIrp = pIrp;
-      IoSetCancelRoutine(pIrp, MPIOC_CancelNotificationRoutine);
-   }
-
-         break;
-      }
-
-      case IOCTL_QCDEV_IPV4_MTU_NOTIFY:
-      {
-         // Got duplicated requests, deny it.
-         if (pIocDev->IPV4MtuNotificationIrp != NULL)
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-               ("CacheNotificationIrp: dup IPV4MtuNotificationIrp, reject\n")
-            );
-            *(ULONG *)pIrp->AssociatedIrp.SystemBuffer = QCDEV_DUPLICATED_NOTIFICATION_REQ;
-            pIrp->IoStatus.Information = sizeof( ULONG );
-            pIrp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-            ntStatus = STATUS_UNSUCCESSFUL;
-         }
-         else
-         {
-            // always pend the IRP, never complete it immediately
-            ntStatus = STATUS_PENDING;
-            IoMarkIrpPending(pIrp);
-            pIocDev->IPV4MtuNotificationIrp = pIrp;
-            IoSetCancelRoutine(pIrp, MPIOC_CancelNotificationRoutine);
-         }
-         break;
-      }
-
-      case IOCTL_QCDEV_IPV6_MTU_NOTIFY:
-      {
-         // Got duplicated requests, deny it.
-         if (pIocDev->IPV6MtuNotificationIrp != NULL)
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-               ("CacheNotificationIrp: dup IPV6MtuNotificationIrp, reject\n")
-            );
-            *(ULONG *)pIrp->AssociatedIrp.SystemBuffer = QCDEV_DUPLICATED_NOTIFICATION_REQ;
-            pIrp->IoStatus.Information = sizeof( ULONG );
-            pIrp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-            ntStatus = STATUS_UNSUCCESSFUL;
-         }
-         else
-         {
-            // always pend the IRP, never complete it immediately
-            ntStatus = STATUS_PENDING;
-            IoMarkIrpPending(pIrp);
-            pIocDev->IPV6MtuNotificationIrp = pIrp;
-            IoSetCancelRoutine(pIrp, MPIOC_CancelNotificationRoutine);
-         }
-
-         break;
-      }
-   } // switch
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-   // the dispatch routine will complete the IRP if ntStatus is not pending
-
-   return ntStatus;
-}  // MPIOC_CacheNotificationIrp
-
-VOID MPIOC_CancelNotificationRoutine(PDEVICE_OBJECT DeviceObject, PIRP pIrp)
-{
-   PMPIOC_DEV_INFO pIocDev;
-   PMP_ADAPTER     pAdapter;
-#ifdef QCUSB_TARGET_XP
-   KLOCK_QUEUE_HANDLE levelOrHandle;
-#else
-   KIRQL levelOrHandle;
-#endif
-   PFILE_OBJECT    fileObj;
-   ULONG           QMIType = 0;
-   ANSI_STRING        ansiString;
-   PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(pIrp);
-   KIRQL irql = KeGetCurrentIrql();
-
-   QCNET_DbgPrintG(("-->MPIOC_CancelNotificationRoutine: 0x%p\n", pIrp));
-
-   IoReleaseCancelSpinLock(pIrp->CancelIrql);
-
-   fileObj = irpStack->FileObject;
-
-   if (fileObj->FileName.Length != 0)
-   {
-      RtlUnicodeStringToAnsiString(&ansiString, &(fileObj->FileName), TRUE);
-      if (RtlCharToInteger( (PCSZ)&(ansiString.Buffer[1]), 10, &QMIType) != STATUS_SUCCESS)
-      {
-         QCNET_DbgPrintG(("MPIOC 0x%p - invalid FileObject 0x%p\n", pIrp, DeviceObject));
-         RtlFreeAnsiString(&ansiString);
-         return;
-      }
-      RtlFreeAnsiString(&ansiString);
-   }
-
-   pIocDev = MPIOC_FindIoDevice(NULL, DeviceObject, NULL, NULL, pIrp, QMIType);
-   if (pIocDev == NULL)
-   {
-      QCNET_DbgPrintG(("MPIOC: invalid called DO 0x%p\n", DeviceObject));
-      return;
-   }
-
-   pAdapter = pIocDev->Adapter;
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   IoSetCancelRoutine(pIrp, NULL);  // not necessary
-
-   if (pIrp == pIocDev->NotificationIrp)
-   {
-   pIocDev->NotificationIrp = NULL;
-   }
-   else if (pIrp == pIocDev->IPV4MtuNotificationIrp)
-   {
-      pIocDev->IPV4MtuNotificationIrp = NULL;
-   }
-   else if (pIrp == pIocDev->IPV6MtuNotificationIrp)
-   {
-      pIocDev->IPV6MtuNotificationIrp = NULL;
-   }
-   else
-   {
-      QCNET_DbgPrintG(("MPIOC_CancelNotificationRoutine: unknown IRP 0x%p\n", pIrp));
-   }
-
-   pIrp->IoStatus.Status = STATUS_CANCELLED;
-   pIrp->IoStatus.Information = 0;
-
-   InsertTailList(&pIocDev->IrpCompletionQueue, &pIrp->Tail.Overlay.ListEntry);
-   KeSetEvent(&pIocDev->EmptyCompletionQueueEvent, IO_NO_INCREMENT, FALSE);
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-   QCNET_DbgPrintG(("<--MPIOC_CancelNotificationRoutine: 0x%p\n", pIrp));
-
-}  // MPIOC_CancelNotificationRoutine
-
-NTSTATUS MPIOC_NotifyClient(PIRP pIrp, ULONG info)
-{
-   // if (IoSetCancelRoutine(pIrp, NULL) == NULL)
-   // {
-   //    return STATUS_UNSUCCESSFUL;
-   // }
-   *(ULONG *)pIrp->AssociatedIrp.SystemBuffer = info;
-   pIrp->IoStatus.Information = sizeof( ULONG );
-   pIrp->IoStatus.Status = STATUS_SUCCESS;
-   return STATUS_SUCCESS;
-}  // MPIOC_NotifyClient
-
-void MPIOC_PostRemovalNotification(PMPIOC_DEV_INFO pIocDev)
-{
-   PMP_ADAPTER pAdapter = pIocDev->Adapter;
-   PIRP        tmpIrp;
-   NTSTATUS    nts = STATUS_SUCCESS;
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   tmpIrp = pIocDev->NotificationIrp;
-   if (tmpIrp != NULL)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> PostRemovalNotification: dev 0x%p\n", pAdapter->PortName, pIocDev)
-      );
-      pIocDev->NotificationIrp = NULL;
-      nts = MPIOC_NotifyClient(tmpIrp, MPIOC_REMOVAL_NOTIFICATION);
-      if (nts == STATUS_SUCCESS)
-      {
-         if (IoSetCancelRoutine(tmpIrp, NULL) != NULL)
-         {
-            InsertTailList(&pIocDev->IrpCompletionQueue, &tmpIrp->Tail.Overlay.ListEntry);
-            KeSetEvent(&pIocDev->EmptyCompletionQueueEvent, IO_NO_INCREMENT, FALSE);
-         }
-         else
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> PostRemovalNotification: IRP in cancallation 0x%p\n", pAdapter->PortName, tmpIrp)
-            );
-         }
-      }
-      else
-      {
-         // cannot be post
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_CRITICAL,
-            ("<%s> PostRemovalNotification: critical error: cannot post 0x%p\n", pAdapter->PortName, tmpIrp)
-         );
-      }
-   }
-   else
-   {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> PostRemovalNotification: no notification IRP\n", pAdapter->PortName)
-         );
-   }
-
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-}  // MPIOC_PostRemovalNotification
-
-VOID MPIOC_PostMtuNotification(PMPIOC_DEV_INFO pIocDev, UCHAR IpVer, ULONG Mtu, BOOLEAN UseSpinlock)
-{
-   PMP_ADAPTER pAdapter = pIocDev->Adapter;
-   PIRP        tmpIrp;
-   NTSTATUS    nts = STATUS_SUCCESS;
-   BOOLEAN     bPosted = FALSE;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> -->_PostMtuNotification: IPV%d MTU %d for 0x%p(%d, %d)\n", pAdapter->PortName, IpVer, Mtu, pIocDev,
-         pIocDev->QMIType, pIocDev->ClientId)
-   );
-
-   if (UseSpinlock == TRUE)
-   {
-      NdisAcquireSpinLock(&pIocDev->IoLock);
-   }
-
-   if (IpVer == 4)
-   {
-      tmpIrp = pIocDev->IPV4MtuNotificationIrp;
-   }
-   else if (IpVer == 6)
-   {
-      tmpIrp = pIocDev->IPV6MtuNotificationIrp;
-   }
-   else
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> <--_PostMtuNotification: unsupported IPV%d\n", pAdapter->PortName, IpVer)
-      );
-      if (UseSpinlock == TRUE)
-      {
-         NdisReleaseSpinLock(&pIocDev->IoLock);
-      }
-      return;
-   }
-
-   if (tmpIrp != NULL)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-         ("<%s> PostMtuNotification: IRP 0x%p dev 0x%p (%d, %d)\n", pAdapter->PortName, tmpIrp, pIocDev,
-           pIocDev->QMIType, pIocDev->ClientId)
-      );
-      if (IpVer == 4)
-      {
-         pIocDev->IPV4MtuNotificationIrp = NULL;
-      }
-      else
-      {
-         pIocDev->IPV6MtuNotificationIrp = NULL;
-      }
-      nts = MPIOC_NotifyClient(tmpIrp, Mtu);
-      if (nts == STATUS_SUCCESS)
-      {
-         if (IoSetCancelRoutine(tmpIrp, NULL) != NULL)
-         {
-            InsertTailList(&pIocDev->IrpCompletionQueue, &tmpIrp->Tail.Overlay.ListEntry);
-            // KeSetEvent(&pIocDev->EmptyCompletionQueueEvent, IO_NO_INCREMENT, FALSE);
-            bPosted = TRUE;
-         }
-         else
-         {
-            QCNET_DbgPrint
-            (
-               MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-               ("<%s> PostMtuNotification: IRP in cancallation 0x%p\n", pAdapter->PortName, tmpIrp)
-            );
-         }
-      }
-      else
-      {
-         // cannot be post
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_CRITICAL,
-            ("<%s> PostMtuNotification: critical error: cannot post 0x%p\n", pAdapter->PortName, tmpIrp)
-         );
-      }
-   }
-   else
-   {
-      /***
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_VERBOSE,
-         ("<%s> PostMtuNotification: no MTU notification IRP from 0x%p(%d, %d)\n", pAdapter->PortName, pIocDev,
-            pIocDev->QMIType, pIocDev->ClientId)
-      );
-      ***/
-   }
-
-   if (UseSpinlock == TRUE)
-   {
-      NdisReleaseSpinLock(&pIocDev->IoLock);
-   }
-
-   if (bPosted == TRUE)
-   {
-      MPIOC_EmptyIrpCompletionQueue(pIocDev);
-   }
-
-}  // MPIOC_PostMtuNotification
-
-VOID MPIOC_AdvertiseMTU(PMP_ADAPTER pAdapter, UCHAR IpVersion, ULONG Mtu)
-{
-   PMPIOC_DEV_INFO pIocDev, foundDO = NULL;
-   PLIST_ENTRY     headOfList, peekEntry;
-
-   if ((IpVersion != 4) && (IpVersion != 6))
-   {
-      return;
-   }
-
-   USBIF_SetDataMTU(pAdapter->USBDo, Mtu);
-
-   NdisAcquireSpinLock(MP_CtlLock);
-
-   if (!IsListEmpty(&MP_DeviceList))
-   {
-      headOfList = &MP_DeviceList;
-      peekEntry = headOfList->Flink;
-
-      while (peekEntry != headOfList)
-      {
-         pIocDev = CONTAINING_RECORD
-                   (
-                      peekEntry,
-                      MPIOC_DEV_INFO,
-                      List
-                   );
-         if (pIocDev->Adapter == pAdapter)
-         {
-            MPIOC_PostMtuNotification(pIocDev, IpVersion, Mtu, FALSE);
-         }
-         peekEntry = peekEntry->Flink;
-      } // while
-   }
-
-   NdisReleaseSpinLock(MP_CtlLock);
-
-}  // MPIOC_AdvertiseMTU
-
-NTSTATUS MPIOC_CancelNotificationIrp(PMPIOC_DEV_INFO pIocDev, ULONG Type)
-{
-   PMP_ADAPTER pAdapter = pIocDev->Adapter;
-   NTSTATUS    ntStatus = STATUS_SUCCESS;
-   PIRP        pIrp;
-   PCHAR       pTag;
-
-   NdisAcquireSpinLock(&pIocDev->IoLock);
-
-   if (Type == IOCTL_QCDEV_WAIT_NOTIFY)
-   {
-   pIrp = pIocDev->NotificationIrp;
-      pTag = "RM";
-   }
-   else if (Type == IOCTL_QCDEV_IPV4_MTU_NOTIFY)
-   {
-      pIrp = pIocDev->IPV4MtuNotificationIrp;
-      pTag = "V4";
-   }
-   else if (Type == IOCTL_QCDEV_IPV6_MTU_NOTIFY)
-   {
-      pIrp = pIocDev->IPV6MtuNotificationIrp;
-      pTag = "V6";
-   }
-   else
-   {
-      pIrp = NULL;
-      pTag = "NONE";
-   }
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> -->MPIOC_CancelNotificationIrp: <%s> 0x%p\n", pAdapter->PortName, pTag, pIrp)
-   );
-
-   if (pIrp != NULL)
-   {
-
-      if (IoSetCancelRoutine(pIrp, NULL) != NULL)
-      {
-         if (Type == IOCTL_QCDEV_WAIT_NOTIFY)
-         {
-         pIocDev->NotificationIrp = NULL;
-         }
-         else if (Type == IOCTL_QCDEV_IPV4_MTU_NOTIFY)
-         {
-            pIocDev->IPV4MtuNotificationIrp = NULL;
-         }
-         else if (Type == IOCTL_QCDEV_IPV6_MTU_NOTIFY)
-         {
-            pIocDev->IPV6MtuNotificationIrp = NULL;
-         }
-         pIrp->IoStatus.Status = STATUS_CANCELLED;
-         pIrp->IoStatus.Information = 0;
-
-         InsertTailList(&pIocDev->IrpCompletionQueue, &pIrp->Tail.Overlay.ListEntry);
-         KeSetEvent(&pIocDev->EmptyCompletionQueueEvent, IO_NO_INCREMENT, FALSE);
-      }
-      else
-      {
-         QCNET_DbgPrint
-         (
-            MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-            ("<%s> MPIOC_CancelNotificationIrp: IRP in cancallation 0x%p\n", pAdapter->PortName, pIrp)
-         );
-      }
-   }
-   NdisReleaseSpinLock(&pIocDev->IoLock);
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL,
-      ("<%s> <--MPIOC_CancelNotificationIrp: <%s> 0x%p/0x%p/0x%p\n", pAdapter->PortName, pTag,
-        pIocDev->NotificationIrp, pIocDev->IPV4MtuNotificationIrp, pIocDev->IPV6MtuNotificationIrp)
-   );
-
-   return ntStatus;
-}  // MPIOC_CancelNotificationIrp
-
-// This function must be called within MP_CtlLock
-ULONG MPIOC_GetClientOpenCount(VOID)
-{
-   PMPIOC_DEV_INFO pIocDev;
-   PLIST_ENTRY     headOfList, peekEntry;
-   ULONG           count = 0;
-
-   if (!IsListEmpty(&MP_DeviceList))
-   {
-      headOfList = &MP_DeviceList;
-      peekEntry = headOfList->Flink;
-
-      while (peekEntry != headOfList)
-      {
-         pIocDev = CONTAINING_RECORD
-                   (
-                      peekEntry,
-                      MPIOC_DEV_INFO,
-                      List
-                   );
-
-         count += pIocDev->DeviceOpenCount;
-         peekEntry = peekEntry->Flink;
-      }
-   }
-
-   return count;
-}  // MPIOC_GetClientOpenCount
-
-BOOLEAN MPIOC_LocalProcessing(PIRP Irp)
-{
-   PIO_STACK_LOCATION  irpStack = IoGetCurrentIrpStackLocation(Irp);
-   BOOLEAN localProcessing = TRUE;
-
-   switch (irpStack->MajorFunction)
-   {
-      case IRP_MJ_CLEANUP:
-      case IRP_MJ_CLOSE:
-      {
-         break;
-      }
-
-      case IRP_MJ_DEVICE_CONTROL:
-      {
-         switch (irpStack->Parameters.DeviceIoControl.IoControlCode)
-         {
-            case IOCTL_QCDEV_SET_DBG_UMSK:
-            {
-               break;
-            }
-
-            default:
-            {
-               localProcessing = FALSE;
-               break;
-            }
-         }
-
-         break;
-      }
-
-      default:
-      {
-         localProcessing = FALSE;
-         break;
-      }
-
-   }  // switch
-
-   return localProcessing;
-
-}  // MPIOC_LocalProcessing
-
-NDIS_STATUS MPIOC_ResetDeviceSecurity
-(
-   PMP_ADAPTER     pAdapter,
-   PUNICODE_STRING DeviceLinkName
-)
-{
-   HANDLE               doHandle = NULL;
-   NTSTATUS             ntStatus;
-   OBJECT_ATTRIBUTES    objectAttr;
-   IO_STATUS_BLOCK      ioStatus;
-   PSECURITY_DESCRIPTOR pSecurityDesc;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_TRACE,
-      ("<%s> -->_ResetDeviceSecurity\n", pAdapter->PortName)
-   );
-
-   // prepare object attributes for ZwOpenFile
-   InitializeObjectAttributes
-   (
-      &objectAttr,
-      DeviceLinkName,
-      OBJ_KERNEL_HANDLE,  // can only be accessed in kernel mode
-      NULL,
-      NULL
-   );
-
-   // Allocate security descriptor
-   pSecurityDesc = ExAllocatePool(NonPagedPool, PAGE_SIZE);
-   if (pSecurityDesc == NULL)
-   {
-      ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-      goto ExitPoint;
-   }
-   RtlZeroMemory(pSecurityDesc, PAGE_SIZE);
-
-   // create a new security descriptor which has no security constraints
-   ntStatus = RtlCreateSecurityDescriptor
-              (
-                 pSecurityDesc,
-                 SECURITY_DESCRIPTOR_REVISION
-              );
-   if (ntStatus != STATUS_SUCCESS)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> _ResetDeviceSecurity: failure A 0x%x\n", pAdapter->PortName, ntStatus)
-      );
-      goto ExitPoint;
-   }
-
-   // Open the device to get handle to our device object
-   ntStatus = ZwOpenFile
-              (
-                 &doHandle,
-                 WRITE_DAC,
-                 &objectAttr,
-                 &ioStatus,
-                 0,
-                 0
-              );
-   if (ntStatus != STATUS_SUCCESS)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> _ResetDeviceSecurity: failure B 0x%x\n", pAdapter->PortName, ntStatus)
-      );
-      goto ExitPoint;
-   }
-
-   // now, we set security settings without security constraints
-   ntStatus = ZwSetSecurityObject
-              (
-                 doHandle,
-                 DACL_SECURITY_INFORMATION,
-                 pSecurityDesc
-              );
-   if (ntStatus != STATUS_SUCCESS)
-   {
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_ERROR,
-         ("<%s> _ResetDeviceSecurity: failure C 0x%x\n", pAdapter->PortName, ntStatus)
-      );
-      ZwClose(doHandle);
-      goto ExitPoint;
-   }
-
-   ntStatus = ZwClose(doHandle);
-
-ExitPoint:
-
-   if (pSecurityDesc != NULL)
-   {
-      ExFreePool(pSecurityDesc);
-   }
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_TRACE,
-      ("<%s> <--_ResetDeviceSecurity 0x%x\n", pAdapter->PortName, ntStatus)
-   );
-   return ntStatus;
-
-} // MPIOC_ResetDeviceSecurity
-
-NTSTATUS MPIOC_GetPeerDeviceNameCompletion
-(
-   PDEVICE_OBJECT pDO,
-   PIRP           pIrp,
-   PVOID          pContext
-)
-{
-   PMP_ADAPTER pAdapter = (PMP_ADAPTER)pContext;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL,
-      MP_DBG_LEVEL_TRACE,
-      ("<%s> MPIOC_GetPeerDeviceNameCompletion (IRP 0x%p IoStatus: 0x%x)\n", pAdapter->PortName,
-        pIrp, pIrp->IoStatus.Status)
-   );
-
-   KeSetEvent(pIrp->UserEvent, 0, FALSE);
-
-   return STATUS_MORE_PROCESSING_REQUIRED;
-}  // MPIOC_GetPeerDeviceNameCompletion
-
-NTSTATUS MPIOC_GetPeerDeviceName(PMP_ADAPTER pAdapter, PIRP Irp, ULONG BufLen)
-{
-   PIRP pIrp = NULL;
-   PIO_STACK_LOCATION nextstack;
-   NTSTATUS Status;
-   KEVENT Event;
-   PDEVICE_EXTENSION pDevExt = (PDEVICE_EXTENSION)pAdapter->USBDo->DeviceExtension;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL,
-      MP_DBG_LEVEL_TRACE,
-      ("<%s> -->MPIOC_GetPeerDeviceName\n", pAdapter->PortName)
-   );
-
-   KeInitializeEvent(&Event, SynchronizationEvent, FALSE);
-
-   pIrp = IoAllocateIrp((CCHAR)(pDevExt->StackDeviceObject->StackSize+2), FALSE );
-   if( pIrp == NULL )
-   {
-       QCNET_DbgPrint
-       (
-          MP_DBG_MASK_CONTROL,
-          MP_DBG_LEVEL_ERROR,
-          ("<%s> MPIOC_GetPeerDeviceName failed to allocate an IRP\n", pAdapter->PortName)
-       );
-       return NDIS_STATUS_FAILURE;
-   }
-
-   pIrp->AssociatedIrp.SystemBuffer = Irp->AssociatedIrp.SystemBuffer;
-
-   // set the event
-   pIrp->UserEvent = &Event;
-
-   nextstack = IoGetNextIrpStackLocation(pIrp);
-   nextstack->MajorFunction = IRP_MJ_DEVICE_CONTROL;
-   nextstack->Parameters.DeviceIoControl.IoControlCode = IOCTL_QCDEV_GET_PEER_DEV_NAME;
-   nextstack->Parameters.DeviceIoControl.OutputBufferLength = BufLen;
-
-   IoSetCompletionRoutine
-   (
-      pIrp,
-      MPIOC_GetPeerDeviceNameCompletion,
-      pAdapter,
-      TRUE,TRUE,TRUE
-   );
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL,
-      MP_DBG_LEVEL_TRACE,
-      ("<%s> MPIOC_GetPeerDeviceName (IRP 0x%p)\n", pAdapter->PortName, pIrp)
-   );
-
-   Status = IoCallDriver(pDevExt->StackDeviceObject, pIrp);
-
-   KeWaitForSingleObject(&Event, Executive, KernelMode, TRUE, 0);
-
-   Status = pIrp->IoStatus.Status;
-
-   Irp->IoStatus.Status = Status;
-   Irp->IoStatus.Information = pIrp->IoStatus.Information;
-
-   MPMAIN_PrintBytes
-   (
-      Irp->AssociatedIrp.SystemBuffer,
-      Irp->IoStatus.Information,
-      Irp->IoStatus.Information,
-      "PEER-INFO",
-      pAdapter,
-      MP_DBG_MASK_CONTROL, MP_DBG_LEVEL_DETAIL
-   );
-
-   IoFreeIrp(pIrp);
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL,
-      MP_DBG_LEVEL_TRACE,
-      ("<%s> <--MPIOC_GetPeerDeviceName (IRP 0x%p ST 0x%x)\n", pAdapter->PortName, Irp, Status)
-   );
-   return Status;
-}  // MPIOC_GetPeerDeviceName
-
-// Retrieve the primary adapter
-PMP_ADAPTER GetPrimaryAdapter(PMP_ADAPTER pAdapter)
-{
-   PMP_ADAPTER       pTempAdapter = NULL;
-
-   DisconnectedAllAdapters(pAdapter, &pTempAdapter);
-
-   return pTempAdapter;
-}  // GetPrimaryAdapter
-
-NTSTATUS MPIOC_GetPrimaryAdapterName(PMP_ADAPTER pAdapter, PIRP Irp, ULONG BufLen)
-{
-   PMP_ADAPTER pPrimaryAdapter = NULL;
-   NTSTATUS ntStatus = STATUS_SUCCESS;
-   int nameLen;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL,
-      MP_DBG_LEVEL_ERROR,
-      ("<%s> -->MPIOC_GetPrimaryAdapterName\n", pAdapter->PortName)
-   );
-
-   pPrimaryAdapter = GetPrimaryAdapter(pAdapter);
-
-   if (pPrimaryAdapter == NULL)
-   {
-      ntStatus = STATUS_UNSUCCESSFUL;
-      Irp->IoStatus.Status = ntStatus;
-      Irp->IoStatus.Information = 0;
-
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL,
-         MP_DBG_LEVEL_ERROR,
-         ("<%s> MPIOC_GetPrimaryAdapterName: failed to get primary adapter\n", pAdapter->PortName)
-      );
-      return ntStatus;
-   }
-
-   // nameLen = strlen(pPrimaryAdapter->FriendlyName);
-   nameLen = pAdapter->FriendlyNameWLen;
-
-   if (BufLen <= nameLen)
-   {
-      ntStatus = STATUS_BUFFER_TOO_SMALL;
-      Irp->IoStatus.Status = ntStatus;
-      Irp->IoStatus.Information = 0;
-
-      QCNET_DbgPrint
-      (
-         MP_DBG_MASK_CONTROL,
-         MP_DBG_LEVEL_ERROR,
-         ("<%s> MPIOC_GetPrimaryAdapterName: buffer too small\n", pAdapter->PortName)
-      );
-      return ntStatus;
-   }
-
-   RtlZeroMemory(Irp->AssociatedIrp.SystemBuffer, BufLen);
-   RtlCopyMemory
-   (
-      Irp->AssociatedIrp.SystemBuffer,
-      pPrimaryAdapter->FriendlyNameW,
-      nameLen
-   );
-   Irp->IoStatus.Status = ntStatus;
-   Irp->IoStatus.Information = nameLen;
-
-   QCNET_DbgPrint
-   (
-      MP_DBG_MASK_CONTROL,
-      MP_DBG_LEVEL_DETAIL,
-      ("<%s> <--MPIOC_GetPrimaryAdapterName <%ws> %dB\n", pAdapter->PortName,
-        pPrimaryAdapter->FriendlyNameW, pAdapter->FriendlyNameWLen)
-   );
-
-   return ntStatus;
-}  // MPIOC_GetPrimaryAdapterName
-
-#endif  // defined(IOCTL_INTERFACE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                        if ((pIocDev->ClientId == pQM
+tus

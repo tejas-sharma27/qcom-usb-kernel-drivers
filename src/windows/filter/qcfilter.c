@@ -24,6 +24,7 @@ GENERAL DESCRIPTION
 
 #include "qcfilter.h"
 #include "qcfilterioc.h"
+#include "FilterSecurity.h"
 
 #ifdef EVENT_TRACING
 #define WPP_GLOBALLOGGER
@@ -136,6 +137,11 @@ DriverEntry(PDRIVER_OBJECT  driverObject, PUNICODE_STRING registryPath)
         driverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] =
         driverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] =
         QCFilterDispatchIo;
+
+    // Register dedicated security handlers for DF-Fuzz compliance
+    driverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = FilterDispatchQuerySecurity;
+    driverObject->MajorFunction[IRP_MJ_SET_SECURITY] = FilterDispatchSetSecurity;
+
     //
     // ControlLock is to synchronize multiple threads creating & deleting
     // control deviceobjects.
@@ -2172,7 +2178,7 @@ Success:
                 }
                 break;
             }
-            case  IRP_MJ_WRITE:
+                        case  IRP_MJ_WRITE:
             {
                 KIRQL levelOrHandle;
                 // DbgPrint( "QCFilterDispatchIo IRP_MJ_WRITE: Acquire RemoveLock\n" );
@@ -2187,6 +2193,25 @@ Success:
                         return status;
                     }
                     // DbgPrint( "QCFilterDispatchIo IRP_MJ_WRITE: Release RemoveLock\n");
+                    IoReleaseRemoveLock(&pCtlExt->RmLock, NULL);
+                }
+                break;
+            }
+            case  IRP_MJ_QUERY_SECURITY:
+            case  IRP_MJ_SET_SECURITY:
+            {
+                // DbgPrint( "QCFilterDispatchIo IRP_MJ_*_SECURITY: Acquire RemoveLock\n" );
+                status = IoAcquireRemoveLock(&pCtlExt->RmLock, NULL);
+                if (NT_SUCCESS(status))
+                {
+                    if (pIocFilterDev->DispatchTable[irpStack->MajorFunction] != NULL)
+                    {
+                        status = (pIocFilterDev->DispatchTable[irpStack->MajorFunction])(DeviceObject, Irp);
+                        // DbgPrint( "QCFilterDispatchIo IRP_MJ_*_SECURITY: Release RemoveLock\n" );
+                        IoReleaseRemoveLock(&pCtlExt->RmLock, NULL);
+                        return status;
+                    }
+                    // DbgPrint( "QCFilterDispatchIo IRP_MJ_*_SECURITY: Release RemoveLock\n");
                     IoReleaseRemoveLock(&pCtlExt->RmLock, NULL);
                 }
                 break;
