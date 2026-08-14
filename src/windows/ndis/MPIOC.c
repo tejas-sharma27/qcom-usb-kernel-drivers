@@ -95,11 +95,39 @@ NTSTATUS MPIOC_IRPDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     fileObj = irpStack->FileObject;
 
     /* IRP_MJ_QUERY_SECURITY and IRP_MJ_SET_SECURITY carry no FileObject.
-     * Skip the QMI-type extraction for those major functions entirely. */
-    if ((irpStack->MajorFunction == IRP_MJ_QUERY_SECURITY) ||
-        (irpStack->MajorFunction == IRP_MJ_SET_SECURITY))
+     * Complete them immediately before the device-lookup path, which
+     * requires a non-NULL FileObject and would otherwise return
+     * STATUS_UNSUCCESSFUL for these IRPs. */
+    if (irpStack->MajorFunction == IRP_MJ_QUERY_SECURITY)
     {
-       goto MPIOC_SkipFileNameParse;
+       /* This device does not maintain a custom security descriptor.
+        * Returning STATUS_NOT_SUPPORTED causes the I/O manager to fall
+        * back to the default object-manager security. */
+       Irp->IoStatus.Information = 0;
+       Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+       IoCompleteRequest(Irp, IO_NO_INCREMENT);
+       return STATUS_NOT_SUPPORTED;
+    }
+    if (irpStack->MajorFunction == IRP_MJ_SET_SECURITY)
+    {
+       PSECURITY_DESCRIPTOR sd =
+           irpStack->Parameters.SetSecurity.SecurityDescriptor;
+       NTSTATUS secStatus;
+       /* Validate the descriptor before touching it.  The HLK fuzz test
+        * (FillZeroPageWithNull=True) may supply NULL or a malformed
+        * descriptor; dereferencing it causes a 0xC0000005 AV. */
+       if (sd == NULL || !RtlValidSecurityDescriptor(sd))
+       {
+          secStatus = STATUS_INVALID_PARAMETER;
+       }
+       else
+       {
+          secStatus = STATUS_SUCCESS;
+       }
+       Irp->IoStatus.Information = 0;
+       Irp->IoStatus.Status = secStatus;
+       IoCompleteRequest(Irp, IO_NO_INCREMENT);
+       return secStatus;
     }
 
     if (fileObj != NULL && fileObj->FileName.Length != 0)
